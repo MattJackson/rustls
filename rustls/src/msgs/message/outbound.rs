@@ -215,6 +215,28 @@ impl OutboundOpaqueMessage {
 pub struct PrefixedPayload(Vec<u8>);
 
 impl PrefixedPayload {
+    pub(crate) fn from_reserved(
+        mut bytes: Vec<u8>,
+        required: usize,
+    ) -> Result<Self, crate::OutputStorageError> {
+        if !bytes.is_empty() || required < HEADER_SIZE || bytes.capacity() < required {
+            return Err(crate::OutputStorageError::Integrity);
+        }
+        bytes.resize(HEADER_SIZE, 0);
+        Ok(Self(bytes))
+    }
+
+    /// Verify a caller-supplied buffer before the provider writes into it.
+    pub fn check_reserved_capacity(&self, payload_len: usize) -> Result<(), crate::Error> {
+        if self.0.len() != HEADER_SIZE
+            || payload_len
+                .checked_add(HEADER_SIZE)
+                .map_or(true, |required| required > self.0.capacity())
+        {
+            return Err(crate::OutputStorageError::Integrity.into());
+        }
+        Ok(())
+    }
     pub fn with_capacity(capacity: usize) -> Self {
         let mut prefixed_payload = Vec::with_capacity(HEADER_SIZE + capacity);
         prefixed_payload.resize(HEADER_SIZE, 0);

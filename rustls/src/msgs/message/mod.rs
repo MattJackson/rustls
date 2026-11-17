@@ -11,7 +11,43 @@ mod inbound;
 pub use inbound::{BorrowedPayload, InboundOpaqueMessage, InboundPlainMessage};
 
 mod outbound;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+
+/// Serialized handshake bytes retain their bounded backing through every alias.
+#[derive(Clone, Debug)]
+pub struct EncodedPayload<'a>(EncodedBacking<'a>);
+
+#[derive(Clone, Debug)]
+enum EncodedBacking<'a> {
+    Plain(Payload<'a>),
+    Bounded(Arc<crate::output_storage::OutputBuffer>),
+}
+
+impl EncodedPayload<'_> {
+    pub(crate) fn bounded(bytes: crate::output_storage::OutputBuffer) -> Self {
+        Self(EncodedBacking::Bounded(Arc::new(bytes)))
+    }
+    /// Borrow the encoded bytes without separating them from their retained backing.
+    pub fn bytes(&self) -> &[u8] {
+        match &self.0 {
+            EncodedBacking::Plain(p) => p.bytes(),
+            EncodedBacking::Bounded(p) => p.as_ref().as_ref(),
+        }
+    }
+    /// Own borrowed input, or preserve an existing bounded owner without copying it.
+    pub fn into_owned(self) -> EncodedPayload<'static> {
+        EncodedPayload(match self.0 {
+            EncodedBacking::Plain(p) => EncodedBacking::Plain(p.into_owned()),
+            EncodedBacking::Bounded(p) => EncodedBacking::Bounded(p),
+        })
+    }
+}
+impl<'a> From<Payload<'a>> for EncodedPayload<'a> {
+    fn from(payload: Payload<'a>) -> Self {
+        Self(EncodedBacking::Plain(payload))
+    }
+}
 
 pub(crate) use outbound::read_opaque_message_header;
 pub use outbound::{OutboundChunks, OutboundOpaqueMessage, OutboundPlainMessage, PrefixedPayload};
@@ -22,20 +58,20 @@ pub enum MessagePayload<'a> {
     // one handshake message, parsed
     Handshake {
         parsed: HandshakeMessagePayload<'a>,
-        encoded: Payload<'a>,
+        encoded: EncodedPayload<'a>,
     },
     // (potentially) multiple handshake messages, unparsed
-    HandshakeFlight(Payload<'a>),
+    HandshakeFlight(EncodedPayload<'a>),
     ChangeCipherSpec(ChangeCipherSpecPayload),
     ApplicationData(Payload<'a>),
 }
 
 impl<'a> MessagePayload<'a> {
-    pub fn encode(&self, bytes: &mut Vec<u8>) {
+    pub fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         match self {
             Self::Alert(x) => x.encode(bytes),
-            Self::Handshake { encoded, .. } => bytes.extend(encoded.bytes()),
-            Self::HandshakeFlight(x) => bytes.extend(x.bytes()),
+            Self::Handshake { encoded, .. } => bytes.extend_from_slice(encoded.bytes()),
+            Self::HandshakeFlight(x) => bytes.extend_from_slice(x.bytes()),
             Self::ChangeCipherSpec(x) => x.encode(bytes),
             Self::ApplicationData(x) => x.encode(bytes),
         }
@@ -43,7 +79,7 @@ impl<'a> MessagePayload<'a> {
 
     pub fn handshake(parsed: HandshakeMessagePayload<'a>) -> Self {
         Self::Handshake {
-            encoded: Payload::new(parsed.get_encoding()),
+            encoded: Payload::new(parsed.get_encoding()).into(),
             parsed,
         }
     }
@@ -60,7 +96,7 @@ impl<'a> MessagePayload<'a> {
             ContentType::Handshake => {
                 HandshakeMessagePayload::read_version(&mut r, vers).map(|parsed| Self::Handshake {
                     parsed,
-                    encoded: Payload::Borrowed(payload),
+                    encoded: Payload::Borrowed(payload).into(),
                 })
             }
             ContentType::ChangeCipherSpec => {

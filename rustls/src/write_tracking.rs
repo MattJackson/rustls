@@ -94,6 +94,14 @@ struct Record {
     end: u64,
 }
 
+pub(crate) fn descriptor_layout(
+    records: usize,
+) -> Result<usize, crate::output_storage::OutputStorageError> {
+    alloc::alloc::Layout::array::<Record>(records)
+        .map(|layout| layout.size())
+        .map_err(|_| crate::output_storage::OutputStorageError::Limit)
+}
+
 pub(crate) struct WriteTracker {
     records: VecDeque<Record>,
     capacity: usize,
@@ -103,7 +111,15 @@ pub(crate) struct WriteTracker {
 }
 
 impl WriteTracker {
-    #[cfg(feature = "std")]
+    pub(crate) fn reset_baseline(&mut self, pending: usize) -> Result<(), WriteTrackingError> {
+        if !self.records.is_empty() {
+            return Err(WriteTrackingError::AlreadyStarted);
+        }
+        self.queued = u64::try_from(pending).map_err(|_| WriteTrackingError::Capacity)?;
+        self.consumed = 0;
+        self.progress = WriteProgress::default();
+        Ok(())
+    }
     pub(crate) fn new(
         limits: WriteTrackingLimits,
         pending: usize,

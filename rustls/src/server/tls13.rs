@@ -403,7 +403,7 @@ mod client_hello {
             }
 
             let mut ocsp_response = server_key.get_ocsp();
-            let mut flight = HandshakeFlightTls13::new(&mut self.transcript);
+            let mut flight = HandshakeFlightTls13::new(&mut self.transcript, cx.common);
             let doing_early_data = emit_encrypted_extensions(
                 &mut flight,
                 self.suite,
@@ -554,16 +554,18 @@ mod client_hello {
 
         let sh = Message {
             version: ProtocolVersion::TLSv1_2,
-            payload: MessagePayload::handshake(HandshakeMessagePayload(
-                HandshakePayload::ServerHello(ServerHelloPayload {
-                    legacy_version: ProtocolVersion::TLSv1_2,
-                    random: Random::from(randoms.server),
-                    session_id: *session_id,
-                    cipher_suite: suite.common.suite,
-                    compression_method: Compression::Null,
-                    extensions,
-                }),
-            )),
+            payload: cx
+                .common
+                .handshake(HandshakeMessagePayload(HandshakePayload::ServerHello(
+                    ServerHelloPayload {
+                        legacy_version: ProtocolVersion::TLSv1_2,
+                        random: Random::from(randoms.server),
+                        session_id: *session_id,
+                        cipher_suite: suite.common.suite,
+                        compression_method: Compression::Null,
+                        extensions,
+                    },
+                ))),
         };
 
         cx.common.check_aligned_handshake()?;
@@ -634,7 +636,7 @@ mod client_hello {
 
         let m = Message {
             version: ProtocolVersion::TLSv1_2,
-            payload: MessagePayload::handshake(HandshakeMessagePayload(
+            payload: common.handshake(HandshakeMessagePayload(
                 HandshakePayload::HelloRetryRequest(req),
             )),
         };
@@ -807,6 +809,9 @@ mod client_hello {
         ocsp_response: Option<&[u8]>,
         cert_compressor: &'static dyn CertCompressor,
     ) {
+        if flight.refuse_compression() {
+            return;
+        }
         let payload = CertificatePayloadTls13::new(cert_chain.iter(), ocsp_response);
 
         let Ok(entry) = config
@@ -862,7 +867,7 @@ mod client_hello {
     ) -> KeyScheduleTrafficWithClientFinishedPending {
         let handshake_hash = flight.transcript.current_hash();
         let verify_data = key_schedule.sign_server_finish(&handshake_hash);
-        let verify_data_payload = Payload::new(verify_data.as_ref());
+        let verify_data_payload = Payload::Borrowed(verify_data.as_ref());
 
         let fin = HandshakeMessagePayload(HandshakePayload::Finished(verify_data_payload));
 
@@ -1050,9 +1055,11 @@ impl State<ServerConnectionData> for ExpectCompressedCertificate {
 
         let m = Message {
             version: ProtocolVersion::TLSv1_3,
-            payload: MessagePayload::handshake(HandshakeMessagePayload(
-                HandshakePayload::CertificateTls13(cert_payload.into_owned()),
-            )),
+            payload: cx
+                .common
+                .handshake(HandshakeMessagePayload(HandshakePayload::CertificateTls13(
+                    cert_payload.into_owned(),
+                ))),
         };
 
         Box::new(ExpectCertificate {
@@ -1417,7 +1424,7 @@ impl State<ServerConnectionData> for ExpectFinished {
         let (key_schedule_traffic, resumption) =
             key_schedule_before_finished.into_traffic(self.transcript.current_hash());
 
-        let mut flight = HandshakeFlightTls13::new(&mut self.transcript);
+        let mut flight = HandshakeFlightTls13::new(&mut self.transcript, cx.common);
         for _ in 0..self.send_tickets {
             Self::emit_ticket(&mut flight, self.suite, cx, &resumption, &self.config)?;
         }

@@ -17,7 +17,7 @@ pub enum Payload<'a> {
 }
 
 impl<'a> Codec<'a> for Payload<'a> {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         bytes.extend_from_slice(self.bytes());
     }
 
@@ -61,9 +61,13 @@ impl Payload<'static> {
 }
 
 impl<'a> Codec<'a> for CertificateDer<'a> {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
+        if self.as_ref().len() > 0x00ff_ffff {
+            bytes.fail();
+            return;
+        }
         codec::u24(self.as_ref().len() as u32).encode(bytes);
-        bytes.extend(self.as_ref());
+        bytes.extend_from_slice(self.as_ref());
     }
 
     fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
@@ -94,9 +98,13 @@ impl<C: Cardinality> PayloadU24<'_, C> {
 }
 
 impl<'a, C: Cardinality> Codec<'a> for PayloadU24<'a, C> {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         let inner = self.0.bytes();
         debug_assert!(inner.len() >= C::MIN);
+        if inner.len() > 0x00ff_ffff {
+            bytes.fail();
+            return;
+        }
         codec::u24(inner.len() as u32).encode(bytes);
         bytes.extend_from_slice(inner);
     }
@@ -151,9 +159,13 @@ impl PayloadU16<MaybeEmpty> {
 }
 
 impl<C: Cardinality> Codec<'_> for PayloadU16<C> {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         debug_assert!(self.0.len() >= C::MIN);
-        (self.0.len() as u16).encode(bytes);
+        let Ok(len) = u16::try_from(self.0.len()) else {
+            bytes.fail();
+            return;
+        };
+        len.encode(bytes);
         bytes.extend_from_slice(&self.0);
     }
 
@@ -181,8 +193,12 @@ impl<C: Cardinality> fmt::Debug for PayloadU16<C> {
 pub(crate) struct PayloadU8<C: Cardinality = MaybeEmpty>(pub(crate) Vec<u8>, PhantomData<C>);
 
 impl<C: Cardinality> PayloadU8<C> {
-    pub(crate) fn encode_slice(slice: &[u8], bytes: &mut Vec<u8>) {
-        (slice.len() as u8).encode(bytes);
+    pub(crate) fn encode_slice(slice: &[u8], bytes: &mut dyn crate::msgs::codec::Encoder) {
+        let Ok(len) = u8::try_from(slice.len()) else {
+            bytes.fail();
+            return;
+        };
+        len.encode(bytes);
         bytes.extend_from_slice(slice);
     }
 
@@ -199,10 +215,9 @@ impl PayloadU8<MaybeEmpty> {
 }
 
 impl<C: Cardinality> Codec<'_> for PayloadU8<C> {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         debug_assert!(self.0.len() >= C::MIN);
-        (self.0.len() as u8).encode(bytes);
-        bytes.extend_from_slice(&self.0);
+        Self::encode_slice(&self.0, bytes);
     }
 
     fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {

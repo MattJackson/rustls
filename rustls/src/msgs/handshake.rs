@@ -58,7 +58,7 @@ macro_rules! wrapped_payload(
     }
 
     impl Codec<'_> for $name {
-        fn encode(&self, bytes: &mut Vec<u8>) {
+        fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
             self.0.encode(bytes);
         }
 
@@ -86,7 +86,7 @@ static HELLO_RETRY_REQUEST_RANDOM: Random = Random([
 static ZERO_RANDOM: Random = Random([0u8; 32]);
 
 impl Codec<'_> for Random {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         bytes.extend_from_slice(&self.0);
     }
 
@@ -144,7 +144,7 @@ impl PartialEq for SessionId {
 }
 
 impl Codec<'_> for SessionId {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         debug_assert!(self.len <= 32);
         bytes.push(self.len as u8);
         bytes.extend_from_slice(self.as_ref());
@@ -199,7 +199,7 @@ pub struct UnknownExtension {
 }
 
 impl UnknownExtension {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.payload.encode(bytes);
     }
 
@@ -215,7 +215,7 @@ pub(crate) struct SupportedEcPointFormats {
 }
 
 impl Codec<'_> for SupportedEcPointFormats {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         let inner = LengthPrefixedBuffer::new(ECPointFormat::SIZE_LEN, bytes);
 
         if self.uncompressed {
@@ -298,7 +298,7 @@ impl ServerNamePayload<'_> {
 /// - name types other than ServerNameType::HostName are not defined, and they and
 ///   any data that follows them cannot be skipped over.
 impl<'a> Codec<'a> for ServerNamePayload<'a> {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         let server_name_list = LengthPrefixedBuffer::new(Self::SIZE_LEN, bytes);
 
         let ServerNamePayload::SingleDnsName(dns_name) = self else {
@@ -432,7 +432,7 @@ impl SingleProtocolName {
 }
 
 impl Codec<'_> for SingleProtocolName {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         let body = LengthPrefixedBuffer::new(Self::SIZE_LEN, bytes);
         self.0.encode(body.buf);
     }
@@ -475,7 +475,7 @@ impl KeyShareEntry {
 }
 
 impl Codec<'_> for KeyShareEntry {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.group.encode(bytes);
         self.payload.encode(bytes);
     }
@@ -506,7 +506,7 @@ impl PresharedKeyIdentity {
 }
 
 impl Codec<'_> for PresharedKeyIdentity {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.identity.encode(bytes);
         self.obfuscated_ticket_age.encode(bytes);
     }
@@ -555,7 +555,7 @@ impl PresharedKeyOffer {
 }
 
 impl Codec<'_> for PresharedKeyOffer {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.identities.encode(bytes);
         self.binders.encode(bytes);
     }
@@ -583,7 +583,7 @@ pub(crate) struct OcspCertificateStatusRequest {
 }
 
 impl Codec<'_> for OcspCertificateStatusRequest {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         CertificateStatusType::OCSP.encode(bytes);
         self.responder_ids.encode(bytes);
         self.extensions.encode(bytes);
@@ -604,7 +604,7 @@ pub(crate) enum CertificateStatusRequest {
 }
 
 impl Codec<'_> for CertificateStatusRequest {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         match self {
             Self::Ocsp(r) => r.encode(bytes),
             Self::Unknown((typ, payload)) => {
@@ -650,7 +650,7 @@ pub(crate) struct PskKeyExchangeModes {
 }
 
 impl Codec<'_> for PskKeyExchangeModes {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         let inner = LengthPrefixedBuffer::new(PskKeyExchangeMode::SIZE_LEN, bytes);
         if self.psk_dhe {
             PskKeyExchangeMode::PSK_DHE_KE.encode(inner.buf);
@@ -718,7 +718,7 @@ impl SupportedProtocolVersions {
 }
 
 impl Codec<'_> for SupportedProtocolVersions {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         let inner = LengthPrefixedBuffer::new(Self::LIST_LENGTH, bytes);
         if self.tls13 {
             ProtocolVersion::TLSv1_3.encode(inner.buf);
@@ -837,7 +837,7 @@ pub(crate) struct ClientTicketRequest {
 }
 
 impl Codec<'_> for ClientTicketRequest {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.new_session_count.encode(bytes);
         self.resumption_count.encode(bytes);
     }
@@ -857,7 +857,7 @@ pub(crate) struct ServerTicketRequestHint {
 }
 
 impl Codec<'_> for ServerTicketRequestHint {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.expected_count.encode(bytes);
     }
 
@@ -1042,70 +1042,68 @@ impl ClientExtensions<'_> {
     }
 
     pub(crate) fn used_extensions_in_encoding_order(&self) -> Vec<ExtensionType> {
-        let mut exts = self.order_insensitive_extensions_in_random_order();
-        exts.extend(&self.contiguous_extensions);
-
-        if self
-            .encrypted_client_hello_outer
-            .is_some()
-        {
-            exts.push(ExtensionType::EncryptedClientHelloOuterExtensions);
-        }
-        if self.encrypted_client_hello.is_some() {
-            exts.push(ExtensionType::EncryptedClientHello);
-        }
-        if self.preshared_key_offer.is_some() {
-            exts.push(ExtensionType::PreSharedKey);
-        }
-        exts
+        self.encoding_order().collect()
     }
 
-    /// Returns extensions which don't need a specific order, in randomized order.
-    ///
-    /// Extensions are encoded in three portions:
-    ///
-    /// - First, extensions not otherwise dealt with by other cases.
-    ///   These are encoded in random order, controlled by `self.order_seed`,
-    ///   and this is the set of extensions returned by this function.
-    ///
-    /// - Second, extensions named in `self.contiguous_extensions`, in the order
-    ///   given by that field.
-    ///
-    /// - Lastly, any ECH and PSK extensions (in that order).  These
-    ///   are required to be last by the standard.
-    fn order_insensitive_extensions_in_random_order(&self) -> Vec<ExtensionType> {
-        let mut order = self.collect_used();
-
-        // Remove extensions which have specific order requirements.
-        order.retain(|ext| {
-            !(matches!(
-                ext,
-                ExtensionType::PreSharedKey
-                    | ExtensionType::EncryptedClientHello
-                    | ExtensionType::EncryptedClientHelloOuterExtensions
-            ) || self.contiguous_extensions.contains(ext))
-        });
-
-        order.sort_by_cached_key(|new_ext| {
-            let seed = ((self.order_seed as u32) << 16) | (u16::from(*new_ext) as u32);
-            low_quality_integer_hash(seed)
-        });
-
+    /// One allocation-free ordering recipe for counting, encoding and ECH inspection.
+    /// Preserve the existing stable randomized order, followed by contiguous then ECH/PSK.
+    fn encoding_order(&self) -> impl Iterator<Item = ExtensionType> + '_ {
+        let mut order = [(ExtensionType::Unknown(0), 0u32); Self::ALL_EXTENSIONS.len()];
+        let mut count = 0;
+        for &ext in Self::ALL_EXTENSIONS {
+            if !self.contains_extension(ext)
+                || self
+                    .contiguous_extensions
+                    .contains(&ext)
+                || matches!(
+                    ext,
+                    ExtensionType::PreSharedKey
+                        | ExtensionType::EncryptedClientHello
+                        | ExtensionType::EncryptedClientHelloOuterExtensions
+                )
+            {
+                continue;
+            }
+            let key =
+                low_quality_integer_hash(((self.order_seed as u32) << 16) | u16::from(ext) as u32);
+            let mut at = count;
+            while at > 0 && order[at - 1].1 > key {
+                order[at] = order[at - 1];
+                at -= 1;
+            }
+            order[at] = (ext, key);
+            count += 1;
+        }
         order
+            .into_iter()
+            .take(count)
+            .map(|(ext, _)| ext)
+            .chain(
+                self.contiguous_extensions
+                    .iter()
+                    .copied(),
+            )
+            .chain(
+                [
+                    ExtensionType::EncryptedClientHelloOuterExtensions,
+                    ExtensionType::EncryptedClientHello,
+                    ExtensionType::PreSharedKey,
+                ]
+                .into_iter()
+                .filter(move |&ext| self.contains_extension(ext)),
+            )
     }
 }
 
 impl<'a> Codec<'a> for ClientExtensions<'a> {
-    fn encode(&self, bytes: &mut Vec<u8>) {
-        let order = self.used_extensions_in_encoding_order();
-
-        if order.is_empty() {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
+        let mut order = self.encoding_order().peekable();
+        if order.peek().is_none() {
             return;
         }
-
         let body = LengthPrefixedBuffer::new(ListLength::U16, bytes);
-        for item in order {
-            self.encode_one(item, body.buf);
+        for ext in order {
+            self.encode_one(ext, body.buf);
         }
     }
 
@@ -1157,7 +1155,7 @@ pub(crate) enum ClientSessionTicket {
 }
 
 impl<'a> Codec<'a> for ClientSessionTicket {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         match self {
             Self::Request => (),
             Self::Offer(p) => p.encode(bytes),
@@ -1297,7 +1295,7 @@ impl ServerExtensions<'_> {
 }
 
 impl<'a> Codec<'a> for ServerExtensions<'a> {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         let extensions = LengthPrefixedBuffer::new(ListLength::U16, bytes);
 
         for ext in Self::ALL_EXTENSIONS {
@@ -1338,7 +1336,11 @@ impl ClientHelloPayload {
         bytes
     }
 
-    pub(crate) fn payload_encode(&self, bytes: &mut Vec<u8>, purpose: Encoding) {
+    pub(crate) fn payload_encode(
+        &self,
+        bytes: &mut dyn crate::msgs::codec::Encoder,
+        purpose: Encoding,
+    ) {
         self.client_version.encode(bytes);
         self.random.encode(bytes);
 
@@ -1396,7 +1398,7 @@ impl ClientHelloPayload {
 }
 
 impl Codec<'_> for ClientHelloPayload {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.payload_encode(bytes, Encoding::Standard)
     }
 
@@ -1491,7 +1493,7 @@ impl HelloRetryRequestExtensions<'_> {
 }
 
 impl<'a> Codec<'a> for HelloRetryRequestExtensions<'a> {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         let extensions = LengthPrefixedBuffer::new(ListLength::U16, bytes);
 
         for ext in self
@@ -1535,7 +1537,7 @@ pub(crate) struct HelloRetryRequest {
 }
 
 impl Codec<'_> for HelloRetryRequest {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.payload_encode(bytes, Encoding::Standard)
     }
 
@@ -1558,7 +1560,7 @@ impl Codec<'_> for HelloRetryRequest {
 }
 
 impl HelloRetryRequest {
-    fn payload_encode(&self, bytes: &mut Vec<u8>, purpose: Encoding) {
+    fn payload_encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder, purpose: Encoding) {
         self.legacy_version.encode(bytes);
         HELLO_RETRY_REQUEST_RANDOM.encode(bytes);
         self.session_id.encode(bytes);
@@ -1613,7 +1615,7 @@ pub(crate) struct ServerHelloPayload {
 }
 
 impl Codec<'_> for ServerHelloPayload {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.payload_encode(bytes, Encoding::Standard)
     }
 
@@ -1651,7 +1653,7 @@ impl Codec<'_> for ServerHelloPayload {
 }
 
 impl ServerHelloPayload {
-    fn payload_encode(&self, bytes: &mut Vec<u8>, encoding: Encoding) {
+    fn payload_encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder, encoding: Encoding) {
         debug_assert!(
             !matches!(encoding, Encoding::EchConfirmation),
             "we cannot compute an ECH confirmation on a received ServerHello"
@@ -1694,7 +1696,7 @@ impl CertificateChain<'_> {
 }
 
 impl<'a> Codec<'a> for CertificateChain<'a> {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         Vec::encode(&self.0, bytes)
     }
 
@@ -1741,7 +1743,7 @@ impl CertificateExtensions<'_> {
 }
 
 impl<'a> Codec<'a> for CertificateExtensions<'a> {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         let extensions = LengthPrefixedBuffer::new(ListLength::U16, bytes);
 
         for ext in Self::ALL_EXTENSIONS {
@@ -1772,7 +1774,7 @@ pub(crate) struct CertificateEntry<'a> {
 }
 
 impl<'a> Codec<'a> for CertificateEntry<'a> {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.cert.encode(bytes);
         self.extensions.encode(bytes);
     }
@@ -1815,7 +1817,7 @@ pub(crate) struct CertificatePayloadTls13<'a> {
 }
 
 impl<'a> Codec<'a> for CertificatePayloadTls13<'a> {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.context.encode(bytes);
         self.entries.encode(bytes);
     }
@@ -1919,7 +1921,7 @@ pub(crate) struct EcParameters {
 }
 
 impl Codec<'_> for EcParameters {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.curve_type.encode(bytes);
         self.named_group.encode(bytes);
     }
@@ -1961,7 +1963,7 @@ impl ClientKeyExchangeParams {
         }
     }
 
-    pub(crate) fn encode(&self, buf: &mut Vec<u8>) {
+    pub(crate) fn encode(&self, buf: &mut dyn crate::msgs::codec::Encoder) {
         match self {
             Self::Ecdh(ecdh) => ecdh.encode(buf),
             Self::Dh(dh) => dh.encode(buf),
@@ -1989,7 +1991,7 @@ pub(crate) struct ClientEcdhParams {
 
 #[cfg(feature = "tls12")]
 impl Codec<'_> for ClientEcdhParams {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.public.encode(bytes);
     }
 
@@ -2008,7 +2010,7 @@ pub(crate) struct ClientDhParams {
 
 #[cfg(feature = "tls12")]
 impl Codec<'_> for ClientDhParams {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.public.encode(bytes);
     }
 
@@ -2040,7 +2042,7 @@ impl ServerEcdhParams {
 }
 
 impl Codec<'_> for ServerEcdhParams {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.curve_params.encode(bytes);
         self.public.encode(bytes);
     }
@@ -2088,7 +2090,7 @@ impl ServerDhParams {
 }
 
 impl Codec<'_> for ServerDhParams {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.dh_p.encode(bytes);
         self.dh_g.encode(bytes);
         self.dh_Ys.encode(bytes);
@@ -2127,7 +2129,7 @@ impl ServerKeyExchangeParams {
         }
     }
 
-    pub(crate) fn encode(&self, buf: &mut Vec<u8>) {
+    pub(crate) fn encode(&self, buf: &mut dyn crate::msgs::codec::Encoder) {
         match self {
             Self::Ecdh(ecdh) => ecdh.encode(buf),
             Self::Dh(dh) => dh.encode(buf),
@@ -2153,7 +2155,7 @@ pub(crate) struct ServerKeyExchange {
 }
 
 impl ServerKeyExchange {
-    pub(crate) fn encode(&self, buf: &mut Vec<u8>) {
+    pub(crate) fn encode(&self, buf: &mut dyn crate::msgs::codec::Encoder) {
         self.params.encode(buf);
         self.dss.encode(buf);
     }
@@ -2172,7 +2174,7 @@ impl From<ServerKeyExchange> for ServerKeyExchangePayload {
 }
 
 impl Codec<'_> for ServerKeyExchangePayload {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         match self {
             Self::Known(x) => x.encode(bytes),
             Self::Unknown(x) => x.encode(bytes),
@@ -2260,7 +2262,7 @@ pub(crate) struct CertificateRequestPayload {
 }
 
 impl Codec<'_> for CertificateRequestPayload {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.certtypes.encode(bytes);
         self.sigschemes.encode(bytes);
         self.canames.encode(bytes);
@@ -2298,7 +2300,7 @@ extension_struct! {
 }
 
 impl Codec<'_> for CertificateRequestExtensions {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         let extensions = LengthPrefixedBuffer::new(ListLength::U16, bytes);
 
         for ext in Self::ALL_EXTENSIONS {
@@ -2338,7 +2340,7 @@ pub(crate) struct CertificateRequestPayloadTls13 {
 }
 
 impl Codec<'_> for CertificateRequestPayloadTls13 {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.context.encode(bytes);
         self.extensions.encode(bytes);
     }
@@ -2375,7 +2377,7 @@ impl NewSessionTicketPayload {
 }
 
 impl Codec<'_> for NewSessionTicketPayload {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.lifetime_hint.encode(bytes);
         self.ticket.encode(bytes);
     }
@@ -2400,7 +2402,7 @@ extension_struct! {
 }
 
 impl Codec<'_> for NewSessionTicketExtensions {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         let extensions = LengthPrefixedBuffer::new(ListLength::U16, bytes);
 
         for ext in Self::ALL_EXTENSIONS {
@@ -2446,7 +2448,7 @@ impl NewSessionTicketPayloadTls13 {
 }
 
 impl Codec<'_> for NewSessionTicketPayloadTls13 {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.lifetime.encode(bytes);
         self.age_add.encode(bytes);
         self.nonce.encode(bytes);
@@ -2486,7 +2488,7 @@ pub(crate) struct CertificateStatus<'a> {
 }
 
 impl<'a> Codec<'a> for CertificateStatus<'a> {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         CertificateStatusType::OCSP.encode(bytes);
         self.ocsp_response.encode(bytes);
     }
@@ -2532,7 +2534,7 @@ pub(crate) struct CompressedCertificatePayload<'a> {
 }
 
 impl<'a> Codec<'a> for CompressedCertificatePayload<'a> {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.alg.encode(bytes);
         codec::u24(self.uncompressed_len).encode(bytes);
         self.compressed.encode(bytes);
@@ -2591,7 +2593,7 @@ pub(crate) enum HandshakePayload<'a> {
 }
 
 impl HandshakePayload<'_> {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         use self::HandshakePayload::*;
         match self {
             HelloRequest | ServerHelloDone | EndOfEarlyData => {}
@@ -2684,7 +2686,7 @@ impl HandshakePayload<'_> {
 pub struct HandshakeMessagePayload<'a>(pub(crate) HandshakePayload<'a>);
 
 impl<'a> Codec<'a> for HandshakeMessagePayload<'a> {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.payload_encode(bytes, Encoding::Standard);
     }
 
@@ -2804,11 +2806,13 @@ impl<'a> HandshakeMessagePayload<'a> {
         match &self.0 {
             HandshakePayload::ClientHello(ch) => match &ch.preshared_key_offer {
                 Some(offer) => {
-                    let mut binders_encoding = Vec::new();
+                    let mut binders_encoding = crate::msgs::codec::CountingEncoder::default();
                     offer
                         .binders
                         .encode(&mut binders_encoding);
-                    binders_encoding.len()
+                    binders_encoding
+                        .finish()
+                        .unwrap_or(usize::MAX)
                 }
                 _ => 0,
             },
@@ -2816,7 +2820,11 @@ impl<'a> HandshakeMessagePayload<'a> {
         }
     }
 
-    pub(crate) fn payload_encode(&self, bytes: &mut Vec<u8>, encoding: Encoding) {
+    pub(crate) fn payload_encode(
+        &self,
+        bytes: &mut dyn crate::msgs::codec::Encoder,
+        encoding: Encoding,
+    ) {
         // output type, length, and encoded payload
         self.0
             .wire_handshake_type()
@@ -2859,7 +2867,7 @@ pub struct HpkeSymmetricCipherSuite {
 }
 
 impl Codec<'_> for HpkeSymmetricCipherSuite {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.kdf_id.encode(bytes);
         self.aead_id.encode(bytes);
     }
@@ -2889,7 +2897,7 @@ pub struct HpkeKeyConfig {
 }
 
 impl Codec<'_> for HpkeKeyConfig {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.config_id.encode(bytes);
         self.kem_id.encode(bytes);
         self.public_key.encode(bytes);
@@ -2939,7 +2947,7 @@ impl EchConfigContents {
 }
 
 impl Codec<'_> for EchConfigContents {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.key_config.encode(bytes);
         self.maximum_name_length.encode(bytes);
         let dns_name = &self.public_name.borrow();
@@ -2982,7 +2990,7 @@ impl TlsListElement for EchConfigPayload {
 }
 
 impl Codec<'_> for EchConfigPayload {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         match self {
             Self::V18(c) => {
                 // Write the version, the length, and the contents.
@@ -3031,7 +3039,7 @@ impl EchConfigExtension {
 }
 
 impl Codec<'_> for EchConfigExtension {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.ext_type().encode(bytes);
 
         let nested = LengthPrefixedBuffer::new(ListLength::U16, bytes);
@@ -3074,7 +3082,7 @@ pub(crate) enum EncryptedClientHello {
 }
 
 impl Codec<'_> for EncryptedClientHello {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         match self {
             Self::Outer(payload) => {
                 EchClientHelloType::ClientHelloOuter.encode(bytes);
@@ -3117,7 +3125,7 @@ pub(crate) struct EncryptedClientHelloOuter {
 }
 
 impl Codec<'_> for EncryptedClientHelloOuter {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.cipher_suite.encode(bytes);
         self.config_id.encode(bytes);
         self.enc.encode(bytes);
@@ -3144,7 +3152,7 @@ pub(crate) struct ServerEncryptedClientHello {
 }
 
 impl Codec<'_> for ServerEncryptedClientHello {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.retry_configs.encode(bytes);
     }
 

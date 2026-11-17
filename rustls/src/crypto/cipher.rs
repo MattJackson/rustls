@@ -146,6 +146,22 @@ pub trait MessageDecrypter: Send + Sync {
 
 /// Objects with this trait can encrypt TLS messages.
 pub trait MessageEncrypter: Send + Sync {
+    /// Exact requested output backing including the TLS header. `None` refuses bounded output.
+    /// Implementations must allocate no other Rust output scratch in `encrypt_with_buffer`.
+    fn output_storage_bytes(&self, _plaintext_len: usize) -> Option<usize> {
+        None
+    }
+
+    /// Encrypt into supplied preallocated backing without replacing or growing it.
+    /// Unsupported providers are refused before any sequence-consuming call.
+    fn encrypt_with_buffer(
+        &mut self,
+        _msg: OutboundPlainMessage<'_>,
+        _seq: u64,
+        _payload: PrefixedPayload,
+    ) -> Result<OutboundOpaqueMessage, Error> {
+        Err(crate::OutputStorageError::UnsupportedProvider.into())
+    }
     /// The exact positional correspondence of input plaintext within the encrypted payload,
     /// excluding the TLS record header. `None` means this encrypter provides no such guarantee.
     ///

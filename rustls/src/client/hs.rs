@@ -199,6 +199,12 @@ fn emit_client_hello_for_retry(
     mut ech_state: Option<EchState>,
 ) -> NextStateOrError<'static> {
     let config = &input.config;
+    if cx.common.output_storage.is_some() && (config.ech_mode.is_some() || ech_state.is_some()) {
+        return Err(crate::OutputStorageError::UnsupportedConfiguration(
+            crate::OutputStorageFeature::Ech,
+        )
+        .into());
+    }
     // Defense in depth: the ECH state should be None if ECH is disabled based on config
     // builder semantics.
     let forbids_tls12 = cx.common.is_quic() || ech_state.is_some();
@@ -460,7 +466,12 @@ fn emit_client_hello_for_retry(
         // normal.
         (_, Some(tls13_session)) => Some((
             tls13_session.suite(),
-            tls13::fill_in_psk_binder(&tls13_session, &transcript_buffer, &mut chp),
+            tls13::fill_in_psk_binder_for_connection(
+                &tls13_session,
+                &transcript_buffer,
+                &mut chp,
+                cx.common,
+            )?,
         )),
 
         // No early key schedule in other cases.
@@ -480,7 +491,7 @@ fn emit_client_hello_for_retry(
             // (retryreq == None means we're in the "initial ClientHello" case)
             None => ProtocolVersion::TLSv1_0,
         },
-        payload: MessagePayload::handshake(chp),
+        payload: cx.common.handshake(chp),
     };
 
     if retryreq.is_some() {

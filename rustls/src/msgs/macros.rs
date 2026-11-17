@@ -57,7 +57,7 @@ macro_rules! enum_builder {
         impl Codec<'_> for $enum_name {
             // NOTE(allow) fully qualified Vec is only needed in no-std mode
             #[allow(unused_qualifications)]
-            fn encode(&self, bytes: &mut alloc::vec::Vec<u8>) {
+            fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
                 <$uint>::from(*self).encode(bytes);
             }
 
@@ -214,7 +214,7 @@ macro_rules! extension_struct {
             fn encode_one(
                 &self,
                 typ: ExtensionType,
-                output: &mut Vec<u8>,
+                output: &mut dyn crate::msgs::codec::Encoder,
             ) {
                 match typ {
                     $(
@@ -225,6 +225,15 @@ macro_rules! extension_struct {
 
                     )*
                     _ => {},
+                }
+            }
+
+            /// Return a list of extensions whose items are `Some`
+            #[allow(dead_code)]
+            fn contains_extension(&self, typ: ExtensionType) -> bool {
+                match typ {
+                    $( $item_id => self.$item_slot.is_some(), )*
+                    _ => false,
                 }
             }
 

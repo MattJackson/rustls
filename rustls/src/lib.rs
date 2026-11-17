@@ -438,6 +438,9 @@ mod error;
 mod hash_hs;
 #[cfg(any(feature = "std", feature = "hashbrown"))]
 mod limited_cache;
+mod output_storage;
+#[cfg(test)]
+mod output_storage_test;
 mod rand;
 mod record_layer;
 #[cfg(feature = "std")]
@@ -450,6 +453,9 @@ mod verify;
 #[cfg(test)]
 mod verifybench;
 mod write_tracking;
+pub use crate::output_storage::{
+    OutputStorageError, OutputStorageFeature, OutputStorageLimits, OutputStoragePlan,
+};
 mod x509;
 #[macro_use]
 mod check;
@@ -475,7 +481,7 @@ pub mod internal {
             pub use crate::msgs::base::{Payload, PayloadU16};
         }
         pub mod codec {
-            pub use crate::msgs::codec::{Codec, Reader};
+            pub use crate::msgs::codec::{Codec, Encoder, Reader};
         }
         pub mod enums {
             pub use crate::msgs::enums::{

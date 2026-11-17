@@ -922,5 +922,11 @@ fn funded_vectored_writer_skips_empty_slices_before_fixed_stack_batch() {
     do_handshake(&mut client, &mut server);
     let mut slices = [IoSlice::new(&[]); 66];
     slices[65] = IoSlice::new(b"data");
-    assert_eq!(server.writer().write_vectored(&slices).unwrap(), 4);
+    assert_eq!(
+        server
+            .writer()
+            .write_vectored(&slices)
+            .unwrap(),
+        4
+    );
 }

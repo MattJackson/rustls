@@ -385,7 +385,7 @@ impl fmt::Debug for ServerSessionValue {
 }
 
 impl Codec<'_> for ServerSessionValue {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         if let Some(sni) = &self.sni {
             1u8.encode(bytes);
             let sni_bytes: &str = sni.as_ref();

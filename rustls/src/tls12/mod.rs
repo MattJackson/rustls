@@ -218,8 +218,8 @@ impl ConnectionSecrets {
         &self.master_secret[..]
     }
 
-    fn make_verify_data(&self, handshake_hash: &hash::Output, label: &[u8]) -> Vec<u8> {
-        let mut out = vec![0u8; 12];
+    fn make_verify_data(&self, handshake_hash: &hash::Output, label: &[u8]) -> [u8; 12] {
+        let mut out = [0u8; 12];
 
         self.suite.prf_provider.for_secret(
             &mut out,
@@ -231,11 +231,11 @@ impl ConnectionSecrets {
         out
     }
 
-    pub(crate) fn client_verify_data(&self, handshake_hash: &hash::Output) -> Vec<u8> {
+    pub(crate) fn client_verify_data(&self, handshake_hash: &hash::Output) -> [u8; 12] {
         self.make_verify_data(handshake_hash, b"client finished")
     }
 
-    pub(crate) fn server_verify_data(&self, handshake_hash: &hash::Output) -> Vec<u8> {
+    pub(crate) fn server_verify_data(&self, handshake_hash: &hash::Output) -> [u8; 12] {
         self.make_verify_data(handshake_hash, b"server finished")
     }
 

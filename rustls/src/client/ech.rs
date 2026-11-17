@@ -163,6 +163,12 @@ impl EchConfig {
         server_name: ServerName<'static>,
         config: &ClientConfig,
     ) -> Result<EchState, Error> {
+        if config.output_storage.is_some() {
+            return Err(crate::OutputStorageError::UnsupportedConfiguration(
+                crate::OutputStorageFeature::Ech,
+            )
+            .into());
+        }
         EchState::new(
             self,
             server_name.clone(),
@@ -454,7 +460,7 @@ impl EchState {
         self,
         ks: &mut KeyScheduleHandshakeStart,
         server_hello: &ServerHelloPayload,
-        server_hello_encoded: &Payload<'_>,
+        server_hello_encoded: &crate::msgs::message::EncodedPayload<'_>,
         hash: &'static dyn Hash,
         server_name: &mut ServerName<'static>,
         common: &mut CommonState,
@@ -793,7 +799,7 @@ impl EchState {
 
     fn server_hello_conf(
         server_hello: &ServerHelloPayload,
-        server_hello_encoded: &Payload<'_>,
+        server_hello_encoded: &crate::msgs::message::EncodedPayload<'_>,
     ) -> Message<'static> {
         // The confirmation is computed over the server hello, which has had
         // its `random` field altered to zero the final 8 bytes.
@@ -802,13 +808,13 @@ impl EchState {
         // allow for efficiency in its in-memory representation.  That means
         // we operate here on the received encoding, as the confirmation needs
         // to be computed on that.
-        let mut encoded = server_hello_encoded.clone().into_vec();
+        let mut encoded = server_hello_encoded.bytes().to_vec();
         encoded[SERVER_HELLO_ECH_CONFIRMATION_SPAN].fill(0x00);
 
         Message {
             version: ProtocolVersion::TLSv1_3,
             payload: MessagePayload::Handshake {
-                encoded: Payload::Owned(encoded),
+                encoded: Payload::Owned(encoded).into(),
                 parsed: HandshakeMessagePayload(HandshakePayload::ServerHello(
                     server_hello.clone(),
                 )),
@@ -828,7 +834,7 @@ impl EchState {
         Message {
             version: ProtocolVersion::TLSv1_3,
             payload: MessagePayload::Handshake {
-                encoded: Payload::new(hmp_encoded),
+                encoded: Payload::new(hmp_encoded).into(),
                 parsed: hmp,
             },
         }
