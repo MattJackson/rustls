@@ -15,11 +15,14 @@ fn plan(records: usize, ciphertext: usize, serialization: usize) -> OutputStorag
 
 #[test]
 fn quote_rejects_layout_overflow_before_allocating() {
-    assert!(OutputStoragePlan::new(OutputStorageLimits {
-        pending_records: NonZeroUsize::new(usize::MAX).unwrap(),
-        ciphertext_bytes: NonZeroUsize::new(1).unwrap(),
-        serialization_bytes: NonZeroUsize::new(1).unwrap(),
-    }).is_err());
+    assert!(
+        OutputStoragePlan::new(OutputStorageLimits {
+            pending_records: NonZeroUsize::new(usize::MAX).unwrap(),
+            ciphertext_bytes: NonZeroUsize::new(1).unwrap(),
+            serialization_bytes: NonZeroUsize::new(1).unwrap(),
+        })
+        .is_err()
+    );
 }
 
 #[test]
