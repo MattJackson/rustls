@@ -17,6 +17,13 @@ use rustls_test::{
 };
 
 fn established(suite: SupportedCipherSuite, records: usize) -> ServerConnection {
+    established_pair(suite, records).1
+}
+
+fn established_pair(
+    suite: SupportedCipherSuite,
+    records: usize,
+) -> (rustls::ClientConnection, ServerConnection) {
     let provider = CryptoProvider {
         cipher_suites: vec![suite],
         ..aws_lc_rs::default_provider()
@@ -37,7 +44,7 @@ fn established(suite: SupportedCipherSuite, records: usize) -> ServerConnection 
             max_pending_records: records,
         })
         .unwrap();
-    server
+    (client, server)
 }
 
 struct Prefix {
@@ -357,6 +364,15 @@ impl MessageEncrypter for FailingEncrypter {
 }
 
 fn failing_connection() -> (ServerConnection, Arc<FailureSwitch>) {
+    let (_, server, switch) = failing_pair();
+    (server, switch)
+}
+
+fn failing_pair() -> (
+    rustls::ClientConnection,
+    ServerConnection,
+    Arc<FailureSwitch>,
+) {
     let SupportedCipherSuite::Tls13(base) = cipher_suite::TLS13_AES_128_GCM_SHA256 else {
         unreachable!()
     };
@@ -375,7 +391,8 @@ fn failing_connection() -> (ServerConnection, Arc<FailureSwitch>) {
         aead_alg: algorithm,
         quic: None,
     }));
-    (established(SupportedCipherSuite::Tls13(suite), 4), switch)
+    let (client, server) = established_pair(SupportedCipherSuite::Tls13(suite), 4);
+    (client, server, switch)
 }
 
 #[test]
@@ -493,6 +510,27 @@ fn unavailable_or_invalid_provider_mapping_refuses_before_output() {
                 .is_empty()
         );
     }
+}
+
+#[test]
+fn received_key_update_encryption_failure_reaches_packet_boundary() {
+    let (mut client, mut server, switch) = failing_pair();
+    client.refresh_traffic_keys().unwrap();
+    switch
+        .armed
+        .store(true, Ordering::SeqCst);
+    rustls_test::transfer(&mut client, &mut server);
+    assert!(server.process_new_packets().is_err());
+    let progress = server.write_progress().unwrap();
+    assert_eq!(progress.accepted_plaintext, 0);
+    assert_eq!(progress.written_plaintext, 0);
+    assert_eq!(progress.fault, Some(WriteTrackingFault::Encryption));
+    assert!(
+        server
+            .write_tls(&mut io::sink())
+            .is_err()
+    );
+    assert_eq!(switch.sequences.lock().unwrap().len(), 1);
 }
 
 #[test]
