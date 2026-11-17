@@ -29,6 +29,7 @@ use crate::msgs::enums::{
     EchVersion, ExtensionType, HpkeAead, HpkeKdf, HpkeKem, KeyUpdateRequest, NamedGroup,
     PskKeyExchangeMode, ServerNameType,
 };
+use crate::msgs::message::EncodedPayload;
 use crate::rand;
 use crate::sync::Arc;
 use crate::verify::DigitallySignedStruct;
@@ -492,14 +493,14 @@ impl Codec<'_> for KeyShareEntry {
 #[derive(Clone, Debug)]
 pub(crate) struct PresharedKeyIdentity {
     /// RFC8446: `opaque identity<1..2^16-1>;`
-    pub(crate) identity: PayloadU16<NonEmpty>,
+    pub(crate) identity: EncodedPayload<'static>,
     pub(crate) obfuscated_ticket_age: u32,
 }
 
 impl PresharedKeyIdentity {
     pub(crate) fn new(id: Vec<u8>, age: u32) -> Self {
         Self {
-            identity: PayloadU16::new(id),
+            identity: Payload::new(id).into(),
             obfuscated_ticket_age: age,
         }
     }
@@ -507,13 +508,13 @@ impl PresharedKeyIdentity {
 
 impl Codec<'_> for PresharedKeyIdentity {
     fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
-        self.identity.encode(bytes);
+        PayloadU16::<NonEmpty>::encode_slice(self.identity.bytes(), bytes);
         self.obfuscated_ticket_age.encode(bytes);
     }
 
     fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
         Ok(Self {
-            identity: PayloadU16::read(r)?,
+            identity: Payload::new(PayloadU16::<NonEmpty>::read(r)?.0).into(),
             obfuscated_ticket_age: u32::read(r)?,
         })
     }
@@ -526,10 +527,28 @@ impl TlsListElement for PresharedKeyIdentity {
     };
 }
 
-wrapped_payload!(
-    /// RFC8446: `opaque PskBinderEntry<32..255>;`
-    pub(crate) struct PresharedKeyBinder, PayloadU8<NonEmpty>,
-);
+/// RFC8446: `opaque PskBinderEntry<32..255>;`
+#[derive(Clone, Debug)]
+pub(crate) struct PresharedKeyBinder(pub(crate) EncodedPayload<'static>);
+
+impl From<Vec<u8>> for PresharedKeyBinder {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self(Payload::new(bytes).into())
+    }
+}
+impl AsRef<[u8]> for PresharedKeyBinder {
+    fn as_ref(&self) -> &[u8] {
+        self.0.bytes()
+    }
+}
+impl Codec<'_> for PresharedKeyBinder {
+    fn encode(&self, out: &mut dyn crate::msgs::codec::Encoder) {
+        PayloadU8::<NonEmpty>::encode_slice(self.as_ref(), out);
+    }
+    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+        Ok(Self::from(PayloadU8::<NonEmpty>::read(r)?.0))
+    }
+}
 
 /// RFC8446: `PskBinderEntry binders<33..2^16-1>;`
 impl TlsListElement for PresharedKeyBinder {
@@ -546,10 +565,10 @@ pub(crate) struct PresharedKeyOffer {
 
 impl PresharedKeyOffer {
     /// Make a new one with one entry.
-    pub(crate) fn new(id: PresharedKeyIdentity, binder: Vec<u8>) -> Self {
+    pub(crate) fn new(id: PresharedKeyIdentity, binder: impl Into<PresharedKeyBinder>) -> Self {
         Self {
             identities: vec![id],
-            binders: vec![PresharedKeyBinder::from(binder)],
+            binders: vec![binder.into()],
         }
     }
 }
@@ -1151,21 +1170,21 @@ fn trim_hostname_trailing_dot_for_sni(dns_name: &DnsName<'_>) -> DnsName<'static
 #[derive(Clone, Debug)]
 pub(crate) enum ClientSessionTicket {
     Request,
-    Offer(Payload<'static>),
+    Offer(EncodedPayload<'static>),
 }
 
 impl<'a> Codec<'a> for ClientSessionTicket {
     fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         match self {
             Self::Request => (),
-            Self::Offer(p) => p.encode(bytes),
+            Self::Offer(p) => bytes.extend_from_slice(p.bytes()),
         }
     }
 
     fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
         Ok(match r.left() {
             0 => Self::Request,
-            _ => Self::Offer(Payload::read(r).into_owned()),
+            _ => Self::Offer(Payload::read(r).into_owned().into()),
         })
     }
 }
@@ -2378,8 +2397,7 @@ impl NewSessionTicketPayload {
 
 impl Codec<'_> for NewSessionTicketPayload {
     fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
-        self.lifetime_hint.encode(bytes);
-        self.ticket.encode(bytes);
+        encode_ticket_fields(self.lifetime_hint, None, &self.ticket.0, None, bytes);
     }
 
     fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
@@ -2449,11 +2467,13 @@ impl NewSessionTicketPayloadTls13 {
 
 impl Codec<'_> for NewSessionTicketPayloadTls13 {
     fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
-        self.lifetime.encode(bytes);
-        self.age_add.encode(bytes);
-        self.nonce.encode(bytes);
-        self.ticket.encode(bytes);
-        self.extensions.encode(bytes);
+        encode_ticket_fields(
+            self.lifetime,
+            Some((self.age_add, &self.nonce.0)),
+            &self.ticket.0,
+            Some(&self.extensions),
+            bytes,
+        );
     }
 
     fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
@@ -2479,6 +2499,49 @@ impl Codec<'_> for NewSessionTicketPayloadTls13 {
 }
 
 // -- RFC6066 certificate status types
+/// Only locally emitted ticket messages carry these prepaid owners. Incoming decode stays
+/// with its existing cache-owned representation, so connection H cannot leak into the cache.
+#[derive(Debug)]
+pub(crate) struct BoundedNewSessionTicketPayload {
+    pub(crate) lifetime: u32,
+    pub(crate) nonce: Option<(u32, crate::TicketBuffer)>,
+    pub(crate) ticket: crate::TicketBuffer,
+    pub(crate) extensions: NewSessionTicketExtensions,
+}
+
+impl BoundedNewSessionTicketPayload {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
+        encode_ticket_fields(
+            self.lifetime,
+            self.nonce
+                .as_ref()
+                .map(|(age, nonce)| (*age, nonce.as_ref())),
+            self.ticket.as_ref(),
+            self.nonce
+                .as_ref()
+                .map(|_| &self.extensions),
+            bytes,
+        );
+    }
+}
+
+fn encode_ticket_fields(
+    lifetime: u32,
+    nonce: Option<(u32, &[u8])>,
+    ticket: &[u8],
+    extensions: Option<&NewSessionTicketExtensions>,
+    bytes: &mut dyn crate::msgs::codec::Encoder,
+) {
+    lifetime.encode(bytes);
+    if let Some((age, nonce)) = nonce {
+        age.encode(bytes);
+        PayloadU8::<MaybeEmpty>::encode_slice(nonce, bytes);
+    }
+    PayloadU16::<MaybeEmpty>::encode_slice(ticket, bytes);
+    if let Some(extensions) = extensions {
+        extensions.encode(bytes);
+    }
+}
 
 /// Only supports OCSP
 #[derive(Clone, Debug)]
@@ -2584,6 +2647,7 @@ pub(crate) enum HandshakePayload<'a> {
     ClientKeyExchange(Payload<'a>),
     NewSessionTicket(NewSessionTicketPayload),
     NewSessionTicketTls13(NewSessionTicketPayloadTls13),
+    BoundedNewSessionTicket(BoundedNewSessionTicketPayload),
     EncryptedExtensions(Box<ServerExtensions<'a>>),
     KeyUpdate(KeyUpdateRequest),
     Finished(Payload<'a>),
@@ -2610,6 +2674,7 @@ impl HandshakePayload<'_> {
             CertificateVerify(x) => x.encode(bytes),
             NewSessionTicket(x) => x.encode(bytes),
             NewSessionTicketTls13(x) => x.encode(bytes),
+            BoundedNewSessionTicket(x) => x.encode(bytes),
             EncryptedExtensions(x) => x.encode(bytes),
             KeyUpdate(x) => x.encode(bytes),
             Finished(x) => x.encode(bytes),
@@ -2634,7 +2699,9 @@ impl HandshakePayload<'_> {
             ServerHelloDone => HandshakeType::ServerHelloDone,
             EndOfEarlyData => HandshakeType::EndOfEarlyData,
             ClientKeyExchange(_) => HandshakeType::ClientKeyExchange,
-            NewSessionTicket(_) | NewSessionTicketTls13(_) => HandshakeType::NewSessionTicket,
+            NewSessionTicket(_) | NewSessionTicketTls13(_) | BoundedNewSessionTicket(_) => {
+                HandshakeType::NewSessionTicket
+            }
             EncryptedExtensions(_) => HandshakeType::EncryptedExtensions,
             KeyUpdate(_) => HandshakeType::KeyUpdate,
             Finished(_) => HandshakeType::Finished,
@@ -2672,6 +2739,7 @@ impl HandshakePayload<'_> {
             ClientKeyExchange(x) => ClientKeyExchange(x.into_owned()),
             NewSessionTicket(x) => NewSessionTicket(x),
             NewSessionTicketTls13(x) => NewSessionTicketTls13(x),
+            BoundedNewSessionTicket(x) => BoundedNewSessionTicket(x),
             EncryptedExtensions(x) => EncryptedExtensions(Box::new(x.into_owned())),
             KeyUpdate(x) => KeyUpdate(x),
             Finished(x) => Finished(x.into_owned()),

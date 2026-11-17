@@ -309,7 +309,7 @@ mod client_hello {
 
                 for (i, psk_id) in psk_offer.identities.iter().enumerate() {
                     let maybe_resume_data = self
-                        .attempt_tls13_ticket_decryption(&psk_id.identity.0)
+                        .attempt_tls13_ticket_decryption(psk_id.identity.bytes())
                         .map(|resumedata| {
                             resumedata.set_freshness(psk_id.obfuscated_ticket_age, now)
                         })
@@ -1323,6 +1323,24 @@ fn get_server_session_value(
     )
 }
 
+fn ticket_extensions(
+    config: &ServerConfig,
+    stateless: bool,
+) -> crate::msgs::handshake::NewSessionTicketExtensions {
+    let mut extensions = crate::msgs::handshake::NewSessionTicketExtensions::default();
+    if config.max_early_data_size > 0 {
+        if !stateless {
+            extensions.max_early_data_size = Some(config.max_early_data_size);
+        } else {
+            // We implement RFC8446 section 8.1: by enforcing that 0-RTT is
+            // only possible if using stateful resumption
+            warn!("early_data with stateless resumption is not allowed");
+        }
+    }
+
+    extensions
+}
+
 struct ExpectFinished {
     config: Arc<ServerConfig>,
     transcript: HandshakeHash,
@@ -1339,6 +1357,51 @@ impl ExpectFinished {
         resumption: &KeyScheduleResumption,
         config: &ServerConfig,
     ) -> Result<(), Error> {
+        if let Some(account) = &cx.common.output_storage {
+            let storage = crate::TicketStorage::new(account);
+            let secure_random = config.provider.secure_random;
+            let mut nonce = storage.allocate(32)?;
+            nonce.extend_from_slice(&[0; 32])?;
+            secure_random.fill(nonce.as_mut())?;
+            let age_add = rand::random_u32(secure_random)?;
+            let now = config.current_time()?;
+            let value =
+                get_server_session_value(suite, resumption, cx, nonce.as_ref(), now, age_add);
+            let stateless = config.ticketer.enabled();
+            let (ticket, lifetime) = if stateless {
+                let plain = storage.encode(|out| value.encode(out))?;
+                let ticket = config
+                    .ticketer
+                    .encrypt_bounded(plain.as_ref(), &storage)
+                    .map_err(|error| storage.fail(error))?;
+                let Some(ticket) = ticket else { return Ok(()) };
+                (ticket, config.ticketer.lifetime())
+            } else {
+                let mut id = storage.allocate(32)?;
+                id.extend_from_slice(&[0; 32])?;
+                secure_random.fill(id.as_mut())?;
+                // This session/id copy belongs exclusively to the stateful negotiation cache.
+                // Never transfer a connection H owner into that longer-lived cache.
+                if !config
+                    .session_storage
+                    .put(id.as_ref().to_vec(), value.get_encoding())
+                {
+                    trace!("resumption not available; not issuing ticket");
+                    return Ok(());
+                }
+                (id, 24 * 60 * 60)
+            };
+            let payload = crate::msgs::handshake::BoundedNewSessionTicketPayload {
+                lifetime,
+                nonce: Some((age_add, nonce)),
+                ticket,
+                extensions: ticket_extensions(config, stateless),
+            };
+            flight.add(HandshakeMessagePayload(
+                HandshakePayload::BoundedNewSessionTicket(payload),
+            ));
+            return Ok(());
+        }
         let secure_random = config.provider.secure_random;
         let nonce = rand::random_vec(secure_random, 32)?;
         let age_add = rand::random_u32(secure_random)?;
@@ -1369,15 +1432,7 @@ impl ExpectFinished {
 
         let mut payload = NewSessionTicketPayloadTls13::new(lifetime, age_add, nonce, ticket);
 
-        if config.max_early_data_size > 0 {
-            if !stateless {
-                payload.extensions.max_early_data_size = Some(config.max_early_data_size);
-            } else {
-                // We implement RFC8446 section 8.1: by enforcing that 0-RTT is
-                // only possible if using stateful resumption
-                warn!("early_data with stateless resumption is not allowed");
-            }
-        }
+        payload.extensions = ticket_extensions(config, stateless);
 
         let t = HandshakeMessagePayload(HandshakePayload::NewSessionTicketTls13(payload));
         trace!("sending new ticket {t:?} (stateless: {stateless})");

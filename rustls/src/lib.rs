@@ -439,6 +439,8 @@ mod hash_hs;
 #[cfg(any(feature = "std", feature = "hashbrown"))]
 mod limited_cache;
 mod output_storage;
+mod ticket_storage;
+pub use crate::ticket_storage::{TicketBuffer, TicketStorage};
 #[cfg(test)]
 mod output_storage_test;
 mod rand;
