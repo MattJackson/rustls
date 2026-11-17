@@ -788,22 +788,41 @@ fn emit_ticket(
     ticketer: &dyn ProducesTickets,
     now: UnixTime,
 ) -> Result<(), Error> {
-    let plain = get_server_connection_value_tls12(secrets, using_ems, cx, now).get_encoding();
-
-    // If we can't produce a ticket for some reason, we can't
-    // report an error. Send an empty one.
-    let ticket = ticketer
-        .encrypt(&plain)
-        .unwrap_or_default();
-    let ticket_lifetime = ticketer.lifetime();
-
+    let value = get_server_connection_value_tls12(secrets, using_ems, cx, now);
+    let payload = if let Some(account) = cx.common.output_storage.clone() {
+        let storage = crate::TicketStorage::new(&account);
+        let plain = storage.encode(|out| value.encode(out))?;
+        let ticket = ticketer
+            .encrypt_bounded(plain.as_ref(), &storage)
+            .map_err(|error| storage.fail(error))?;
+        // Only an ordinary provider failure retains TLS1.2's empty-ticket behavior.
+        let ticket = match ticket {
+            Some(ticket) => ticket,
+            None => storage.allocate(0)?,
+        };
+        HandshakePayload::BoundedNewSessionTicket(
+            crate::msgs::handshake::BoundedNewSessionTicketPayload {
+                lifetime: ticketer.lifetime(),
+                nonce: None,
+                ticket,
+                extensions: crate::msgs::handshake::NewSessionTicketExtensions::default(),
+            },
+        )
+    } else {
+        let plain = value.get_encoding();
+        let ticket = ticketer
+            .encrypt(&plain)
+            .unwrap_or_default();
+        HandshakePayload::NewSessionTicket(NewSessionTicketPayload::new(
+            ticketer.lifetime(),
+            ticket,
+        ))
+    };
     let m = Message {
         version: ProtocolVersion::TLSv1_2,
         payload: cx
             .common
-            .handshake(HandshakeMessagePayload(HandshakePayload::NewSessionTicket(
-                NewSessionTicketPayload::new(ticket_lifetime, ticket),
-            ))),
+            .handshake(HandshakeMessagePayload(payload)),
     };
 
     transcript.add_message(&m);

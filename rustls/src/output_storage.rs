@@ -122,6 +122,8 @@ struct State {
     ciphertext: AtomicUsize,
     serialization: AtomicUsize,
     fault: AtomicU8,
+    #[cfg(test)]
+    allocation_attempts: AtomicUsize,
 }
 
 #[derive(Clone, Debug)]
@@ -135,11 +137,20 @@ impl OutputStorage {
             ciphertext: AtomicUsize::new(0),
             serialization: AtomicUsize::new(0),
             fault: AtomicU8::new(0),
+            #[cfg(test)]
+            allocation_attempts: AtomicUsize::new(0),
         }))
     }
 
     pub(crate) fn plan(&self) -> OutputStoragePlan {
         self.0.plan
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allocation_attempts(&self) -> usize {
+        self.0
+            .allocation_attempts
+            .load(Ordering::Relaxed)
     }
 
     pub(crate) fn fault(&self, error: OutputStorageError) {
@@ -296,6 +307,13 @@ impl OutputBuffer {
     }
     fn allocate(reservation: Reservation) -> Result<Self, OutputStorageError> {
         let mut bytes = Vec::new();
+        #[cfg(test)]
+        if reservation.bytes != 0 {
+            reservation
+                .state
+                .allocation_attempts
+                .fetch_add(1, Ordering::Relaxed);
+        }
         bytes
             .try_reserve_exact(reservation.bytes)
             .map_err(|_| OutputStorageError::Limit)?;
@@ -310,6 +328,12 @@ impl OutputBuffer {
         self.reservation
             .as_ref()
             .map_or(self.bytes.capacity(), |r| r.bytes)
+    }
+
+    pub(crate) fn latch_error(&self, error: OutputStorageError) {
+        if let Some(reservation) = &self.reservation {
+            OutputStorage(reservation.state.clone()).fault(error);
+        }
     }
 
     pub(crate) fn finish_encoding(&self, expected: usize) -> Result<(), OutputStorageError> {
