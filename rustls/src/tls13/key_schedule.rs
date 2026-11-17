@@ -520,8 +520,14 @@ pub(crate) struct KeyScheduleTraffic {
 
 impl KeyScheduleTraffic {
     pub(crate) fn update_encrypter_and_notify(&mut self, common: &mut CommonState) {
-        let secret = self.next_application_traffic_secret(common.side);
+        if common.tracking_fault().is_some() {
+            return;
+        }
         common.enqueue_key_update_notification();
+        if common.tracking_fault().is_some() {
+            return;
+        }
+        let secret = self.next_application_traffic_secret(common.side);
         self.ks.set_encrypter(&secret, common);
     }
 
@@ -529,8 +535,10 @@ impl KeyScheduleTraffic {
         &mut self,
         common: &mut CommonState,
     ) -> Result<(), Error> {
+        common.check_tracking()?;
         common.check_aligned_handshake()?;
         common.send_msg_encrypt(Message::build_key_update_request().into());
+        common.check_tracking()?;
         let secret = self.next_application_traffic_secret(common.side);
         self.ks.set_encrypter(&secret, common);
         // Sending the request with the exhausted keys asked for another update,

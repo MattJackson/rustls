@@ -146,6 +146,16 @@ pub trait MessageDecrypter: Send + Sync {
 
 /// Objects with this trait can encrypt TLS messages.
 pub trait MessageEncrypter: Send + Sync {
+    /// The exact positional correspondence of input plaintext within the encrypted payload,
+    /// excluding the TLS record header. `None` means this encrypter provides no such guarantee.
+    ///
+    /// A returned range must have `plaintext_len` bytes, in the same order as the input.
+    /// It must exclude nonce, inner content type, padding and authentication bytes added by
+    /// the encrypter. This is provenance, not a claim of partial-record authentication.
+    fn plaintext_ciphertext_range(&self, _plaintext_len: usize) -> Option<core::ops::Range<usize>> {
+        None
+    }
+
     /// Encrypt the given TLS message `msg`, using the sequence number
     /// `seq` which can be used to derive a unique [`Nonce`].
     fn encrypt(

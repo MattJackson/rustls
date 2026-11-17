@@ -25,6 +25,7 @@ use crate::suites::{PartiallyExtractedSecrets, SupportedCipherSuite};
 use crate::tls12::ConnectionSecrets;
 use crate::unbuffered::{EncryptError, InsufficientSizeError};
 use crate::vecbuf::ChunkVecBuffer;
+use crate::write_tracking::{WriteProgress, WriteTracker, WriteTrackingFault};
 use crate::{quic, record_layer};
 
 /// Connection state common to both client and server connections.
@@ -51,6 +52,8 @@ pub struct CommonState {
     message_fragmenter: MessageFragmenter,
     pub(crate) received_plaintext: ChunkVecBuffer,
     pub(crate) sendable_tls: ChunkVecBuffer,
+    pub(crate) write_tracking: Option<WriteTracker>,
+    pub(crate) application_data_sent: bool,
     queued_key_update_message: Option<Vec<u8>>,
 
     /// Protocol whose key schedule should be used. Unused for TLS < 1.3.
@@ -64,6 +67,31 @@ pub struct CommonState {
 }
 
 impl CommonState {
+    /// Read-only cumulative output evidence, if tracking was enabled on this connection.
+    pub fn write_progress(&self) -> Option<WriteProgress> {
+        self.write_tracking
+            .as_ref()
+            .map(WriteTracker::progress)
+    }
+
+    pub(crate) fn tracking_fault(&self) -> Option<WriteTrackingFault> {
+        self.write_progress()
+            .and_then(|progress| progress.fault)
+    }
+
+    fn fail_tracking(&mut self, fault: WriteTrackingFault) {
+        if let Some(tracker) = &mut self.write_tracking {
+            tracker.fault(fault);
+        }
+    }
+
+    pub(crate) fn check_tracking(&self) -> Result<(), Error> {
+        match self.tracking_fault() {
+            Some(fault) => Err(Error::General(alloc::format!("{fault}"))),
+            None => Ok(()),
+        }
+    }
+
     pub(crate) fn new(side: Side) -> Self {
         Self {
             negotiated_version: None,
@@ -86,6 +114,8 @@ impl CommonState {
             message_fragmenter: MessageFragmenter::default(),
             received_plaintext: ChunkVecBuffer::new(Some(DEFAULT_RECEIVED_PLAINTEXT_LIMIT)),
             sendable_tls: ChunkVecBuffer::new(Some(DEFAULT_BUFFER_LIMIT)),
+            write_tracking: None,
+            application_data_sent: false,
             queued_key_update_message: None,
             protocol: Protocol::Tcp,
             quic: quic::Quic::default(),
@@ -339,7 +369,9 @@ impl CommonState {
             .message_fragmenter
             .fragment_message(&m);
         for m in iter {
-            self.send_single_fragment(m);
+            if !self.send_single_fragment(m) {
+                break;
+            }
         }
     }
 
@@ -379,6 +411,10 @@ impl CommonState {
         // that a write crossing the limit is not sent in part.
         if let Some(last) = (iter.len() as u64).checked_sub(1) {
             if !self.check_pre_encrypt_action(last) {
+                if self.write_tracking.is_some() {
+                    self.fail_tracking(WriteTrackingFault::Integrity);
+                    return 0;
+                }
                 return len;
             }
         }
@@ -397,27 +433,107 @@ impl CommonState {
                 return sent;
             }
 
-            sent += m.payload.len();
-            self.send_single_fragment(m);
+            let fragment_len = m.payload.len();
+            if !self.send_single_fragment(m) {
+                return sent;
+            }
+            sent += fragment_len;
         }
 
         len
     }
 
-    fn send_single_fragment(&mut self, m: OutboundPlainMessage<'_>) {
+    fn send_single_fragment(&mut self, m: OutboundPlainMessage<'_>) -> bool {
+        if self.write_tracking.is_some() {
+            return self.send_tracked_fragment(m);
+        }
         if m.typ == ContentType::Alert {
             // Alerts are always sendable -- never quashed by a PreEncryptAction.
             let em = self.record_layer.encrypt_outgoing(m);
             self.queue_tls_message(em);
-            return;
+            return true;
         }
 
         if !self.check_pre_encrypt_action(0) {
-            return;
+            return true;
         }
 
         let em = self.record_layer.encrypt_outgoing(m);
         self.queue_tls_message(em);
+        true
+    }
+
+    fn send_tracked_fragment(&mut self, m: OutboundPlainMessage<'_>) -> bool {
+        if self.tracking_fault().is_some() {
+            return false;
+        }
+        let application = m.typ == ContentType::ApplicationData;
+        if application
+            && self
+                .write_tracking
+                .as_ref()
+                .is_some_and(|tracker| !tracker.has_capacity())
+        {
+            if self.sendable_tls.is_empty() {
+                self.fail_tracking(WriteTrackingFault::Integrity);
+            }
+            return false;
+        }
+        if m.typ != ContentType::Alert && !self.check_pre_encrypt_action(0) {
+            self.fail_tracking(WriteTrackingFault::Integrity);
+            return false;
+        }
+        let plaintext_len = m.payload.len();
+        let mapping = if application {
+            match self
+                .record_layer
+                .plaintext_ciphertext_range(plaintext_len)
+            {
+                Some(range) if range.start <= range.end && range.len() == plaintext_len => {
+                    Some(range)
+                }
+                Some(_) => {
+                    self.fail_tracking(WriteTrackingFault::Integrity);
+                    return false;
+                }
+                None => {
+                    self.fail_tracking(WriteTrackingFault::Unsupported);
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
+        let encrypted = match self
+            .record_layer
+            .try_encrypt_outgoing(m)
+        {
+            Ok(encrypted) => encrypted,
+            Err(_) => {
+                self.fail_tracking(WriteTrackingFault::Encryption);
+                return false;
+            }
+        };
+        // A pending KeyUpdate precedes this encoded record. Determine offsets after it.
+        self.perhaps_write_key_update();
+        let bytes = encrypted.encode();
+        let mapping = match mapping {
+            Some(range) => {
+                let header = crate::msgs::fragmenter::PACKET_OVERHEAD;
+                match (
+                    range.start.checked_add(header),
+                    range.end.checked_add(header),
+                ) {
+                    (Some(start), Some(end)) if end <= bytes.len() => Some(start..end),
+                    _ => {
+                        self.fail_tracking(WriteTrackingFault::Integrity);
+                        return false;
+                    }
+                }
+            }
+            None => None,
+        };
+        self.queue_encoded(bytes, mapping)
     }
 
     /// Take the remedial action needed before encrypting the record `add` records after the next.
@@ -506,12 +622,30 @@ impl CommonState {
     // Put m into sendable_tls for writing.
     fn queue_tls_message(&mut self, m: OutboundOpaqueMessage) {
         self.perhaps_write_key_update();
-        self.sendable_tls.append(m.encode());
+        self.queue_encoded(m.encode(), None);
+    }
+
+    fn queue_encoded(
+        &mut self,
+        bytes: Vec<u8>,
+        application: Option<core::ops::Range<usize>>,
+    ) -> bool {
+        if let Some(tracker) = &mut self.write_tracking {
+            if tracker.progress().fault.is_some() {
+                return false;
+            }
+            if let Err(fault) = tracker.enqueue(bytes.len(), application) {
+                tracker.fault(fault);
+                return false;
+            }
+        }
+        self.sendable_tls.append(bytes);
+        true
     }
 
     pub(crate) fn perhaps_write_key_update(&mut self) {
         if let Some(message) = self.queued_key_update_message.take() {
-            self.sendable_tls.append(message);
+            self.queue_encoded(message, None);
         }
     }
 
@@ -785,6 +919,19 @@ impl CommonState {
 
     pub(crate) fn enqueue_key_update_notification(&mut self) {
         let message = PlainMessage::from(Message::build_key_update_notify());
+        if self.write_tracking.is_some() {
+            if self.tracking_fault().is_some() {
+                return;
+            }
+            match self
+                .record_layer
+                .try_encrypt_outgoing(message.borrow_outbound())
+            {
+                Ok(encrypted) => self.queued_key_update_message = Some(encrypted.encode()),
+                Err(_) => self.fail_tracking(WriteTrackingFault::Encryption),
+            }
+            return;
+        }
         self.queued_key_update_message = Some(
             self.record_layer
                 .encrypt_outgoing(message.borrow_outbound())
@@ -811,7 +958,9 @@ impl CommonState {
         sendable_plaintext: &mut ChunkVecBuffer,
     ) -> usize {
         self.perhaps_write_key_update();
-        self.send_plain(payload, Limit::Yes, sendable_plaintext)
+        let written = self.send_plain(payload, Limit::Yes, sendable_plaintext);
+        self.application_data_sent |= written > 0;
+        written
     }
 
     pub(crate) fn send_early_plaintext(&mut self, data: &[u8]) -> usize {
@@ -823,7 +972,9 @@ impl CommonState {
             return 0;
         }
 
-        self.send_appdata_encrypt(data.into(), Limit::Yes, false)
+        let written = self.send_appdata_encrypt(data.into(), Limit::Yes, false);
+        self.application_data_sent |= written > 0;
+        written
     }
 
     /// Encrypt and send some plaintext `data`.  `limit` controls

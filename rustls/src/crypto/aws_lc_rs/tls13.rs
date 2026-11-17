@@ -226,6 +226,10 @@ struct AeadMessageDecrypter {
 }
 
 impl MessageEncrypter for AeadMessageEncrypter {
+    fn plaintext_ciphertext_range(&self, len: usize) -> Option<core::ops::Range<usize>> {
+        Some(0..len)
+    }
+
     fn encrypt(
         &mut self,
         msg: OutboundPlainMessage<'_>,
@@ -287,6 +291,10 @@ struct GcmMessageEncrypter {
 }
 
 impl MessageEncrypter for GcmMessageEncrypter {
+    fn plaintext_ciphertext_range(&self, len: usize) -> Option<core::ops::Range<usize>> {
+        Some(0..len)
+    }
+
     fn encrypt(
         &mut self,
         msg: OutboundPlainMessage<'_>,
