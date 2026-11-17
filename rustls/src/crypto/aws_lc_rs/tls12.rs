@@ -302,6 +302,10 @@ impl MessageDecrypter for GcmMessageDecrypter {
 }
 
 impl MessageEncrypter for GcmMessageEncrypter {
+    fn plaintext_ciphertext_range(&self, len: usize) -> Option<core::ops::Range<usize>> {
+        Some(GCM_EXPLICIT_NONCE_LEN..GCM_EXPLICIT_NONCE_LEN.checked_add(len)?)
+    }
+
     fn encrypt(
         &mut self,
         msg: OutboundPlainMessage<'_>,
@@ -383,6 +387,10 @@ impl MessageDecrypter for ChaCha20Poly1305MessageDecrypter {
 }
 
 impl MessageEncrypter for ChaCha20Poly1305MessageEncrypter {
+    fn plaintext_ciphertext_range(&self, len: usize) -> Option<core::ops::Range<usize>> {
+        Some(0..len)
+    }
+
     fn encrypt(
         &mut self,
         msg: OutboundPlainMessage<'_>,
