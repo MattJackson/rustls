@@ -408,4 +408,80 @@ mod tests {
     fn fail_generator() -> Result<Box<dyn ProducesTickets>, GetRandomFailed> {
         Err(GetRandomFailed)
     }
+    // Source-first regression fragment staged for the adopted ticket completion.
+    #[test]
+    fn bounded_ticket_capacities_and_decryption_match_legacy_wire_contract() {
+        use crate::TicketStorage;
+        use crate::output_storage::{OutputStorage, OutputStorageLimits, OutputStoragePlan};
+        use core::num::NonZeroUsize;
+
+        for len in [0usize, 1, 15, 16, 17, 31, 32, 127] {
+            let plain = alloc::vec![0x5a; len];
+            let padded = 16 * (len / 16 + 1);
+            let mac = 16 + 16 + 2 + padded;
+            let result = 16 + 16 + padded + 32;
+            let peak = padded + mac + result;
+            let plan = OutputStoragePlan::new(OutputStorageLimits {
+                pending_records: NonZeroUsize::new(1).unwrap(),
+                ciphertext_bytes: NonZeroUsize::new(1).unwrap(),
+                serialization_bytes: NonZeroUsize::new(peak).unwrap(),
+            })
+            .unwrap();
+            let account = OutputStorage::new(plan);
+            let storage = TicketStorage::new(&account);
+            let ticketer = Rfc5077Ticketer::new().unwrap();
+            let encrypted = ticketer
+                .encrypt_bounded(&plain, &storage)
+                .unwrap()
+                .unwrap();
+            assert_eq!(encrypted.as_ref().len(), result);
+            assert_eq!(encrypted.requested_capacity(), result);
+            assert_eq!(ticketer.decrypt(encrypted.as_ref()), Some(plain));
+            let remainder = account
+                .serialization(peak - result)
+                .unwrap();
+            assert!(account.serialization(1).is_err());
+            drop(encrypted);
+            assert!(account.serialization(result).is_ok());
+            drop(remainder);
+        }
+    }
+
+    #[test]
+    fn bounded_ticket_denial_never_becomes_an_ordinary_missing_ticket() {
+        use crate::output_storage::{OutputStorage, OutputStorageLimits, OutputStoragePlan};
+        use crate::{OutputStorageError, TicketStorage};
+        use core::num::NonZeroUsize;
+
+        let padded = 32;
+        let mac = 16 + 16 + 2 + padded;
+        let result = 16 + 16 + padded + 32;
+        for (limit, attempts) in [
+            (padded - 1, 0),
+            (padded + mac - 1, 1),
+            (padded + mac + result - 1, 2),
+        ] {
+            let plan = OutputStoragePlan::new(OutputStorageLimits {
+                pending_records: NonZeroUsize::new(1).unwrap(),
+                ciphertext_bytes: NonZeroUsize::new(1).unwrap(),
+                serialization_bytes: NonZeroUsize::new(limit).unwrap(),
+            })
+            .unwrap();
+            let account = OutputStorage::new(plan);
+            let storage = TicketStorage::new(&account);
+            let ticketer = Rfc5077Ticketer::new().unwrap();
+            assert!(matches!(
+                ticketer.encrypt_bounded(&[7; 16], &storage),
+                Err(OutputStorageError::Limit)
+            ));
+            assert_eq!(account.allocation_attempts(), attempts);
+            assert!(account.serialization(limit).is_ok());
+            assert_eq!(
+                ticketer
+                    .maximum_ciphertext_len
+                    .load(Ordering::SeqCst),
+                0
+            );
+        }
+    }
 }

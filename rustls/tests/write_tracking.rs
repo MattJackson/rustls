@@ -930,3 +930,30 @@ fn funded_vectored_writer_skips_empty_slices_before_fixed_stack_batch() {
         4
     );
 }
+
+#[test]
+fn funded_actual_rotating_tickets_resume_both_protocol_versions() {
+    for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+        let provider = aws_lc_rs::default_provider();
+        let mut client_config =
+            make_client_config_with_versions(KeyType::Rsa2048, &[version], &provider);
+        let mut server_config =
+            make_server_config_with_versions(KeyType::Rsa2048, &[version], &provider);
+        client_config.cert_compressors.clear();
+        server_config.cert_compressors.clear();
+        client_config.cert_compression_cache =
+            Arc::new(rustls::compress::CompressionCache::Disabled);
+        server_config.cert_compression_cache =
+            Arc::new(rustls::compress::CompressionCache::Disabled);
+        client_config.output_storage = Some(output_plan(256 * 1024));
+        server_config.output_storage = Some(output_plan(256 * 1024));
+        server_config.ticketer = aws_lc_rs::Ticketer::new().unwrap();
+        for expected in [rustls::HandshakeKind::Full, rustls::HandshakeKind::Resumed] {
+            let (mut client, mut server) =
+                make_pair_for_configs(client_config.clone(), server_config.clone());
+            do_handshake(&mut client, &mut server);
+            assert_eq!(client.handshake_kind(), Some(expected));
+            assert_eq!(server.handshake_kind(), Some(expected));
+        }
+    }
+}
