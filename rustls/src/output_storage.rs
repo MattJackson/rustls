@@ -1,8 +1,8 @@
 //! Requested-layout bounds for buffered TLS output, installed before the handshake.
 
-use alloc::alloc::Layout;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::alloc::Layout;
 use core::fmt;
 use core::num::NonZeroUsize;
 use core::ops::{Deref, DerefMut};
