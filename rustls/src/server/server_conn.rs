@@ -81,6 +81,21 @@ pub trait StoresServerSessions: Debug + Send + Sync {
 
 /// A trait for the ability to encrypt and decrypt tickets.
 pub trait ProducesTickets: Debug + Send + Sync {
+    /// Whether every output/scratch backing of `encrypt_bounded` uses the provided H account.
+    /// Returned or temporary buffers must not escape into shared provider/config state.
+    fn supports_bounded_output(&self) -> bool {
+        false
+    }
+
+    /// Encrypt using only the supplied retained output storage, with ordinary key failure
+    /// represented by `Ok(None)`. Storage/integrity refusal is terminal, never a missing ticket.
+    fn encrypt_bounded(
+        &self,
+        _plain: &[u8],
+        storage: &crate::TicketStorage<'_>,
+    ) -> Result<Option<crate::TicketBuffer>, crate::OutputStorageError> {
+        Err(storage.fail(crate::OutputStorageError::UnsupportedProvider))
+    }
     /// Returns true if this implementation will encrypt/decrypt
     /// tickets.  Should return false if this is a dummy
     /// implementation: the server will not send the SessionTicket
@@ -508,9 +523,13 @@ impl ServerConfig {
         // 2. that the process-level default provider is usable with the supplied protocol versions.
         Self::builder_with_provider(
             CryptoProvider::get_default_or_install_from_crate_features().clone(),
-        )
-        .with_protocol_versions(versions)
-        .unwrap()
+        )?;
+        if self.ticketer.enabled() && !self.ticketer.supports_bounded_output() {
+            return Err(crate::OutputStorageError::UnsupportedProvider);
+        }
+        Ok(())
+            .with_protocol_versions(versions)
+            .unwrap()
     }
 
     /// Create a builder for a server configuration with a specific [`CryptoProvider`].

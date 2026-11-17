@@ -33,7 +33,7 @@ impl Ticketer {
     /// [RFC 5077 §4]: https://www.rfc-editor.org/rfc/rfc5077#section-4
     #[cfg(feature = "std")]
     pub fn new() -> Result<Arc<dyn ProducesTickets>, Error> {
-        Ok(Arc::new(crate::ticketer::TicketRotator::new(
+        Ok(Arc::new(crate::ticketer::TicketRotator::new_bounded(
             6 * 60 * 60,
             make_ticket_generator,
         )?))
@@ -105,6 +105,84 @@ impl Rfc5077Ticketer {
 }
 
 impl ProducesTickets for Rfc5077Ticketer {
+    fn supports_bounded_output(&self) -> bool {
+        true
+    }
+
+    fn encrypt_bounded(
+        &self,
+        message: &[u8],
+        storage: &crate::TicketStorage<'_>,
+    ) -> Result<Option<crate::TicketBuffer>, crate::OutputStorageError> {
+        use crate::OutputStorageError::{Integrity, Limit};
+        let padded = message
+            .len()
+            .checked_div(AES_CBC_IV_LEN)
+            .and_then(|n| n.checked_add(1))
+            .and_then(|n| n.checked_mul(AES_CBC_IV_LEN))
+            .ok_or_else(|| storage.fail(Limit))?;
+        let state_len = u16::try_from(padded).map_err(|_| storage.fail(Limit))?;
+        let mac_bytes = self
+            .key_name
+            .len()
+            .checked_add(AES_CBC_IV_LEN)
+            .and_then(|n| n.checked_add(2))
+            .and_then(|n| n.checked_add(padded))
+            .ok_or_else(|| storage.fail(Limit))?;
+        let tag_len = self
+            .hmac_key
+            .algorithm()
+            .digest_algorithm()
+            .output_len();
+        let result_bytes = self
+            .key_name
+            .len()
+            .checked_add(AES_CBC_IV_LEN)
+            .and_then(|n| n.checked_add(padded))
+            .and_then(|n| n.checked_add(tag_len))
+            .ok_or_else(|| storage.fail(Limit))?;
+
+        let mut encrypted_state = storage.allocate(padded)?;
+        encrypted_state.extend_from_slice(message)?;
+        // The existing provider generates the IV and applies PKCS7 in this reserved buffer.
+        let encrypted = self
+            .aes_encrypt_key
+            .encrypt(&mut encrypted_state);
+        // Even a backend error must not mask an infallible Extend overflow.
+        encrypted_state.check_len(encrypted_state.as_ref().len())?;
+        let Ok(dec_ctx) = encrypted else {
+            return Ok(None);
+        };
+        encrypted_state.check_len(padded)?;
+        let Ok(iv): Result<&[u8], _> = (&dec_ctx).try_into() else {
+            return Ok(None);
+        };
+        if iv.len() != AES_CBC_IV_LEN {
+            return Err(storage.fail(Integrity));
+        }
+
+        let mut hmac_data = storage.allocate(mac_bytes)?;
+        hmac_data.extend_from_slice(&self.key_name)?;
+        hmac_data.extend_from_slice(iv)?;
+        hmac_data.extend_from_slice(&state_len.to_be_bytes())?;
+        hmac_data.extend_from_slice(encrypted_state.as_ref())?;
+        hmac_data.check_len(mac_bytes)?;
+        let tag = hmac::sign(&self.hmac_key, hmac_data.as_ref());
+        if tag.as_ref().len() != tag_len {
+            return Err(storage.fail(Integrity));
+        }
+
+        let mut ciphertext = storage.allocate(result_bytes)?;
+        ciphertext.extend_from_slice(&self.key_name)?;
+        ciphertext.extend_from_slice(iv)?;
+        ciphertext.extend_from_slice(encrypted_state.as_ref())?;
+        ciphertext.extend_from_slice(tag.as_ref())?;
+        ciphertext.check_len(result_bytes)?;
+        self.maximum_ciphertext_len
+            .fetch_max(result_bytes, Ordering::SeqCst);
+        Ok(Some(ciphertext))
+    }
+
     fn enabled(&self) -> bool {
         true
     }

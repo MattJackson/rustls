@@ -146,6 +146,15 @@ impl<C: Cardinality> fmt::Debug for PayloadU24<'_, C> {
 pub struct PayloadU16<C: Cardinality = MaybeEmpty>(pub(crate) Vec<u8>, PhantomData<C>);
 
 impl<C: Cardinality> PayloadU16<C> {
+    pub(crate) fn encode_slice(slice: &[u8], bytes: &mut dyn crate::msgs::codec::Encoder) {
+        let Ok(len) = u16::try_from(slice.len()) else {
+            bytes.fail();
+            return;
+        };
+        len.encode(bytes);
+        bytes.extend_from_slice(slice);
+    }
+
     pub fn new(bytes: Vec<u8>) -> Self {
         debug_assert!(bytes.len() >= C::MIN);
         Self(bytes, PhantomData)
@@ -161,12 +170,7 @@ impl PayloadU16<MaybeEmpty> {
 impl<C: Cardinality> Codec<'_> for PayloadU16<C> {
     fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         debug_assert!(self.0.len() >= C::MIN);
-        let Ok(len) = u16::try_from(self.0.len()) else {
-            bytes.fail();
-            return;
-        };
-        len.encode(bytes);
-        bytes.extend_from_slice(&self.0);
+        Self::encode_slice(&self.0, bytes);
     }
 
     fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {

@@ -22,9 +22,22 @@ pub struct EncodedPayload<'a>(EncodedBacking<'a>);
 enum EncodedBacking<'a> {
     Plain(Payload<'a>),
     Bounded(Arc<crate::output_storage::OutputBuffer>),
+    Ticket(Arc<crate::TicketBuffer>),
 }
 
 impl EncodedPayload<'_> {
+    pub(crate) fn ticket(bytes: crate::TicketBuffer) -> Self {
+        Self(EncodedBacking::Ticket(Arc::new(bytes)))
+    }
+
+    pub(crate) fn bytes_mut(&mut self) -> Option<&mut [u8]> {
+        match &mut self.0 {
+            EncodedBacking::Plain(Payload::Owned(bytes)) => Some(bytes),
+            EncodedBacking::Plain(Payload::Borrowed(_)) => None,
+            EncodedBacking::Bounded(bytes) => Arc::get_mut(bytes).map(|bytes| &mut **bytes),
+            EncodedBacking::Ticket(bytes) => Arc::get_mut(bytes).map(AsMut::as_mut),
+        }
+    }
     pub(crate) fn bounded(bytes: crate::output_storage::OutputBuffer) -> Self {
         Self(EncodedBacking::Bounded(Arc::new(bytes)))
     }
@@ -33,6 +46,7 @@ impl EncodedPayload<'_> {
         match &self.0 {
             EncodedBacking::Plain(p) => p.bytes(),
             EncodedBacking::Bounded(p) => p.as_ref().as_ref(),
+            EncodedBacking::Ticket(p) => p.as_ref().as_ref(),
         }
     }
     /// Own borrowed input, or preserve an existing bounded owner without copying it.
@@ -40,6 +54,7 @@ impl EncodedPayload<'_> {
         EncodedPayload(match self.0 {
             EncodedBacking::Plain(p) => EncodedBacking::Plain(p.into_owned()),
             EncodedBacking::Bounded(p) => EncodedBacking::Bounded(p),
+            EncodedBacking::Ticket(p) => EncodedBacking::Ticket(p),
         })
     }
 }

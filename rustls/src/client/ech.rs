@@ -699,7 +699,7 @@ impl EchState {
                 resuming,
                 &self.inner_hello_transcript,
                 &mut chp,
-            ));
+            )?);
 
             // fill_in_psk_binder works on an owned HandshakeMessagePayload, so we need to
             // extract our inner hello back out of it to retain ownership.
@@ -770,8 +770,12 @@ impl EchState {
         for ident in psk_offer.identities.iter_mut() {
             // "For each PSK identity advertised in the ClientHelloInner, the
             // client generates a random PSK identity with the same length."
-            self.secure_random
-                .fill(&mut ident.identity.0)?;
+            self.secure_random.fill(
+                ident
+                    .identity
+                    .bytes_mut()
+                    .ok_or(crate::OutputStorageError::Integrity)?,
+            )?;
             // "It also generates a random, 32-bit, unsigned integer to use as
             // the obfuscated_ticket_age."
             let mut ticket_age = [0_u8; 4];

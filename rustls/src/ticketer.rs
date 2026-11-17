@@ -27,12 +27,66 @@ pub(crate) struct TicketSwitcherState {
 pub struct TicketSwitcher {
     pub(crate) generator: fn() -> Result<Box<dyn ProducesTickets>, rand::GetRandomFailed>,
     lifetime: u32,
+    bounded_factory: bool,
     state: Mutex<TicketSwitcherState>,
     #[cfg(not(feature = "std"))]
     time_provider: &'static dyn TimeProvider,
 }
 
 impl TicketSwitcher {
+    /// Construct a rotator whose factory promises bounded output for every generated producer.
+    /// The initial producers and every selected producer are checked; legacy `new` makes no promise.
+    #[cfg(feature = "std")]
+    #[allow(deprecated)]
+    pub fn new_bounded(
+        lifetime: u32,
+        generator: fn() -> Result<Box<dyn ProducesTickets>, rand::GetRandomFailed>,
+    ) -> Result<Self, Error> {
+        let mut out = Self::new(lifetime, generator)?;
+        {
+            let state = out
+                .state
+                .lock()
+                .ok_or(crate::OutputStorageError::UnsupportedProvider)?;
+            if !state.current.supports_bounded_output()
+                || state
+                    .next
+                    .as_ref()
+                    .is_some_and(|next| !next.supports_bounded_output())
+            {
+                return Err(crate::OutputStorageError::UnsupportedProvider.into());
+            }
+        }
+        out.bounded_factory = true;
+        Ok(out)
+    }
+
+    /// Construct the bounded factory variant with the supplied no-std clock and mutex.
+    #[cfg(not(feature = "std"))]
+    pub fn new_bounded<M: crate::lock::MakeMutex>(
+        lifetime: u32,
+        generator: fn() -> Result<Box<dyn ProducesTickets>, rand::GetRandomFailed>,
+        time_provider: &'static dyn TimeProvider,
+    ) -> Result<Self, Error> {
+        let mut out = Self::new::<M>(lifetime, generator, time_provider)?;
+        {
+            let state = out
+                .state
+                .lock()
+                .ok_or(crate::OutputStorageError::UnsupportedProvider)?;
+            if !state.current.supports_bounded_output()
+                || state
+                    .next
+                    .as_ref()
+                    .is_some_and(|next| !next.supports_bounded_output())
+            {
+                return Err(crate::OutputStorageError::UnsupportedProvider.into());
+            }
+        }
+        out.bounded_factory = true;
+        Ok(out)
+    }
+
     /// Creates a new `TicketSwitcher`, which rotates through sub-ticketers
     /// based on the passage of time.
     ///
@@ -49,6 +103,7 @@ impl TicketSwitcher {
         Ok(Self {
             generator,
             lifetime,
+            bounded_factory: false,
             state: Mutex::new(TicketSwitcherState {
                 next: Some(generator()?),
                 current: generator()?,
@@ -76,6 +131,7 @@ impl TicketSwitcher {
         Ok(Self {
             generator,
             lifetime,
+            bounded_factory: false,
             state: Mutex::new::<M>(TicketSwitcherState {
                 next: Some(generator()?),
                 current: generator()?,
@@ -173,6 +229,37 @@ impl TicketSwitcher {
 }
 
 impl ProducesTickets for TicketSwitcher {
+    fn supports_bounded_output(&self) -> bool {
+        self.bounded_factory
+    }
+
+    fn encrypt_bounded(
+        &self,
+        message: &[u8],
+        storage: &crate::TicketStorage<'_>,
+    ) -> Result<Option<crate::TicketBuffer>, crate::OutputStorageError> {
+        if !self.bounded_factory {
+            return Err(storage.fail(crate::OutputStorageError::UnsupportedProvider));
+        }
+        #[cfg(feature = "std")]
+        let now = UnixTime::now();
+        #[cfg(not(feature = "std"))]
+        let Some(now) = self.time_provider.current_time() else {
+            return Ok(None);
+        };
+        // Keep this exact selected producer/guard alive through the whole operation.
+        let Some(state) = self.maybe_roll(now) else {
+            return Ok(None);
+        };
+        if !state.current.supports_bounded_output() {
+            return Err(storage.fail(crate::OutputStorageError::UnsupportedProvider));
+        }
+        state
+            .current
+            .encrypt_bounded(message, storage)
+            .map_err(|error| storage.fail(error))
+    }
+
     fn lifetime(&self) -> u32 {
         self.lifetime * 2
     }
@@ -245,11 +332,32 @@ pub(crate) struct TicketRotatorState {
 pub struct TicketRotator {
     pub(crate) generator: fn() -> Result<Box<dyn ProducesTickets>, rand::GetRandomFailed>,
     lifetime: u32,
+    bounded_factory: bool,
     state: RwLock<TicketRotatorState>,
 }
 
 #[cfg(feature = "std")]
 impl TicketRotator {
+    /// Construct a rotator whose factory promises bounded output for every generated producer.
+    /// The initial producer and every selected producer are checked before bounded encryption.
+    pub fn new_bounded(
+        lifetime: u32,
+        generator: fn() -> Result<Box<dyn ProducesTickets>, rand::GetRandomFailed>,
+    ) -> Result<Self, Error> {
+        let mut out = Self::new(lifetime, generator)?;
+        {
+            let state = out
+                .state
+                .read()
+                .map_err(|_| crate::OutputStorageError::UnsupportedProvider)?;
+            if !state.current.supports_bounded_output() {
+                return Err(crate::OutputStorageError::UnsupportedProvider.into());
+            }
+        }
+        out.bounded_factory = true;
+        Ok(out)
+    }
+
     /// Creates a new `TicketRotator`, which rotates through sub-ticketers
     /// based on the passage of time.
     ///
@@ -264,6 +372,7 @@ impl TicketRotator {
         Ok(Self {
             generator,
             lifetime,
+            bounded_factory: false,
             state: RwLock::new(TicketRotatorState {
                 current: generator()?,
                 previous: None,
@@ -326,6 +435,32 @@ impl TicketRotator {
 
 #[cfg(feature = "std")]
 impl ProducesTickets for TicketRotator {
+    fn supports_bounded_output(&self) -> bool {
+        self.bounded_factory
+    }
+
+    fn encrypt_bounded(
+        &self,
+        message: &[u8],
+        storage: &crate::TicketStorage<'_>,
+    ) -> Result<Option<crate::TicketBuffer>, crate::OutputStorageError> {
+        if !self.bounded_factory {
+            return Err(storage.fail(crate::OutputStorageError::UnsupportedProvider));
+        }
+        let now = UnixTime::now();
+        // Keep this exact selected producer/guard alive through the whole operation.
+        let Some(state) = self.maybe_roll(now) else {
+            return Ok(None);
+        };
+        if !state.current.supports_bounded_output() {
+            return Err(storage.fail(crate::OutputStorageError::UnsupportedProvider));
+        }
+        state
+            .current
+            .encrypt_bounded(message, storage)
+            .map_err(|error| storage.fail(error))
+    }
+
     fn lifetime(&self) -> u32 {
         self.lifetime * 2
     }

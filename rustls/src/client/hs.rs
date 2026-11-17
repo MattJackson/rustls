@@ -378,7 +378,7 @@ fn emit_client_hello_for_retry(
     }
 
     // Do we have a SessionID or ticket cached for this host?
-    let tls13_session = prepare_resumption(&input.resuming, &mut exts, suite, cx, config);
+    let tls13_session = prepare_resumption(&input.resuming, &mut exts, suite, cx, config)?;
 
     // Extensions MAY be randomized
     // but they also need to keep the same order as the previous ClientHello
@@ -574,7 +574,7 @@ fn prepare_resumption<'a>(
     suite: Option<SupportedCipherSuite>,
     cx: &mut ClientContext<'_>,
     config: &ClientConfig,
-) -> Option<persist::Retrieved<&'a persist::Tls13ClientSessionValue>> {
+) -> Result<Option<persist::Retrieved<&'a persist::Tls13ClientSessionValue>>, Error> {
     // Check whether we're resuming with a non-empty ticket.
     let resuming = match resuming {
         Some(resuming) if !resuming.ticket().is_empty() => resuming,
@@ -585,7 +585,7 @@ fn prepare_resumption<'a>(
                 // If we don't have a ticket, request one.
                 exts.session_ticket = Some(ClientSessionTicket::Request);
             }
-            return None;
+            return Ok(None);
         }
     };
 
@@ -594,30 +594,41 @@ fn prepare_resumption<'a>(
         if config.supports_version(ProtocolVersion::TLSv1_2, cx.common.protocol)
             && config.resumption.tls12_resumption == Tls12Resumption::SessionIdOrTickets
         {
-            exts.session_ticket = Some(ClientSessionTicket::Offer(Payload::new(resuming.ticket())));
+            let ticket = match &cx.common.output_storage {
+                Some(account) => crate::msgs::message::EncodedPayload::ticket(
+                    crate::TicketStorage::new(account).copy(resuming.ticket())?,
+                ),
+                None => Payload::new(resuming.ticket()).into(),
+            };
+            exts.session_ticket = Some(ClientSessionTicket::Offer(ticket));
         }
-        return None; // TLS 1.2, so nothing to return here
+        return Ok(None); // TLS 1.2, so nothing to return here
     };
 
     if !config.supports_version(ProtocolVersion::TLSv1_3, cx.common.protocol) {
-        return None;
+        return Ok(None);
     }
 
     // If the server selected TLS 1.2, we can't resume.
     let suite = match suite {
         Some(SupportedCipherSuite::Tls13(suite)) => Some(suite),
         #[cfg(feature = "tls12")]
-        Some(SupportedCipherSuite::Tls12(_)) => return None,
+        Some(SupportedCipherSuite::Tls12(_)) => return Ok(None),
         None => None,
     };
 
     // If the selected cipher suite can't select from the session's, we can't resume.
     if let Some(suite) = suite {
-        suite.can_resume_from(tls13.suite())?;
+        if suite
+            .can_resume_from(tls13.suite())
+            .is_none()
+        {
+            return Ok(None);
+        }
     }
 
-    tls13::prepare_resumption(config, cx, &tls13, exts, suite.is_some());
-    Some(tls13)
+    tls13::prepare_resumption(config, cx, &tls13, exts, suite.is_some())?;
+    Ok(Some(tls13))
 }
 
 pub(super) fn process_alpn_protocol(

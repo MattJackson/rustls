@@ -333,9 +333,10 @@ pub(super) fn fill_in_psk_binder(
     resuming: &persist::Tls13ClientSessionValue,
     transcript: &HandshakeHashBuffer,
     hmp: &mut HandshakeMessagePayload<'_>,
-) -> KeyScheduleEarly {
+) -> Result<KeyScheduleEarly, Error> {
     let binder_plaintext = hmp.encoding_for_binder_signing();
-    fill_in_psk_binder_from_encoding(resuming, transcript, hmp, &binder_plaintext)
+    fill_in_psk_binder_from_encoding(resuming, transcript, hmp, &binder_plaintext, None)
+        .map_err(Error::from)
 }
 
 pub(super) fn fill_in_psk_binder_for_connection(
@@ -345,7 +346,7 @@ pub(super) fn fill_in_psk_binder_for_connection(
     common: &CommonState,
 ) -> Result<KeyScheduleEarly, Error> {
     let Some(storage) = &common.output_storage else {
-        return Ok(fill_in_psk_binder(resuming, transcript, hmp));
+        return fill_in_psk_binder(resuming, transcript, hmp);
     };
     let result = (|| {
         let mut encoded = storage.encode(|out| hmp.encode(out))?;
@@ -354,9 +355,7 @@ pub(super) fn fill_in_psk_binder_for_connection(
             .checked_sub(hmp.total_binder_length())
             .ok_or(crate::OutputStorageError::Integrity)?;
         encoded.truncate(len);
-        Ok(fill_in_psk_binder_from_encoding(
-            resuming, transcript, hmp, &encoded,
-        ))
+        fill_in_psk_binder_from_encoding(resuming, transcript, hmp, &encoded, Some(storage))
     })();
     result.map_err(|error| {
         storage.fault(error);
@@ -369,7 +368,8 @@ fn fill_in_psk_binder_from_encoding(
     transcript: &HandshakeHashBuffer,
     hmp: &mut HandshakeMessagePayload<'_>,
     binder_plaintext: &[u8],
-) -> KeyScheduleEarly {
+    storage: Option<&crate::output_storage::OutputStorage>,
+) -> Result<KeyScheduleEarly, crate::OutputStorageError> {
     // We need to know the hash function of the suite we're trying to resume into.
     let suite = resuming.suite();
     let suite_hash = suite.common.hash_provider;
@@ -383,23 +383,34 @@ fn fill_in_psk_binder_from_encoding(
     let key_schedule = KeyScheduleEarly::new(suite, resuming.secret());
     let real_binder = key_schedule.resumption_psk_binder_key_and_sign_verify_data(&handshake_hash);
 
-    if let HandshakePayload::ClientHello(ch) = &mut hmp.0 {
-        if let Some(PresharedKeyOffer {
-            binders,
-            identities,
-        }) = &mut ch.preshared_key_offer
-        {
-            // the caller of this function must have set up the desired identity, and a
-            // matching (dummy) binder; or else the binder we compute here will be incorrect.
-            // See `prepare_resumption()`.
-            debug_assert_eq!(identities.len(), 1);
-            debug_assert_eq!(binders.len(), 1);
-            debug_assert_eq!(binders[0].as_ref().len(), real_binder.as_ref().len());
-            binders[0] = PresharedKeyBinder::from(real_binder.as_ref().to_vec());
-        }
+    let HandshakePayload::ClientHello(ch) = &mut hmp.0 else {
+        return Err(crate::OutputStorageError::Integrity);
     };
-
-    key_schedule
+    let Some(PresharedKeyOffer {
+        binders,
+        identities,
+    }) = &mut ch.preshared_key_offer
+    else {
+        return Err(crate::OutputStorageError::Integrity);
+    };
+    if identities.len() != 1
+        || binders.len() != 1
+        || binders[0].as_ref().len() != real_binder.as_ref().len()
+    {
+        return Err(crate::OutputStorageError::Integrity);
+    }
+    if let Some(storage) = storage {
+        if let Some(bytes) = binders[0].0.bytes_mut() {
+            bytes.copy_from_slice(real_binder.as_ref());
+        } else {
+            // A shared dummy keeps its charge; replacement must fit alongside every alias.
+            let bytes = crate::TicketStorage::new(storage).copy(real_binder.as_ref())?;
+            binders[0] = PresharedKeyBinder(crate::msgs::message::EncodedPayload::ticket(bytes));
+        }
+    } else {
+        binders[0] = PresharedKeyBinder::from(real_binder.as_ref().to_vec());
+    }
+    Ok(key_schedule)
 }
 
 pub(super) fn prepare_resumption(
@@ -408,7 +419,7 @@ pub(super) fn prepare_resumption(
     resuming_session: &Retrieved<&persist::Tls13ClientSessionValue>,
     exts: &mut ClientExtensions<'_>,
     doing_retry: bool,
-) {
+) -> Result<(), Error> {
     let resuming_suite = resuming_session.suite();
     cx.common.suite = Some(resuming_suite.into());
     // The EarlyData extension MUST be supplied together with the
@@ -432,12 +443,31 @@ pub(super) fn prepare_resumption(
         .common
         .hash_provider
         .output_len();
-    let binder = vec![0u8; binder_len];
-
-    let psk_identity =
-        PresharedKeyIdentity::new(resuming_session.ticket().to_vec(), obfuscated_ticket_age);
-    let psk_offer = PresharedKeyOffer::new(psk_identity, binder);
-    exts.preshared_key_offer = Some(psk_offer);
+    let (psk_identity, binder) = if let Some(account) = &cx.common.output_storage {
+        let storage = crate::TicketStorage::new(account);
+        if !(32..=255).contains(&binder_len) {
+            return Err(storage
+                .fail(crate::OutputStorageError::Integrity)
+                .into());
+        }
+        let identity = storage.copy(resuming_session.ticket())?;
+        let mut binder = storage.allocate(binder_len)?;
+        binder.extend_from_slice(&[0; 255][..binder_len])?;
+        (
+            PresharedKeyIdentity {
+                identity: crate::msgs::message::EncodedPayload::ticket(identity),
+                obfuscated_ticket_age,
+            },
+            PresharedKeyBinder(crate::msgs::message::EncodedPayload::ticket(binder)),
+        )
+    } else {
+        (
+            PresharedKeyIdentity::new(resuming_session.ticket().to_vec(), obfuscated_ticket_age),
+            PresharedKeyBinder::from(vec![0; binder_len]),
+        )
+    };
+    exts.preshared_key_offer = Some(PresharedKeyOffer::new(psk_identity, binder));
+    Ok(())
 }
 
 pub(super) fn derive_early_traffic_secret(
