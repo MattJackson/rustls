@@ -16,6 +16,95 @@ use rustls_test::{
     make_server_config_with_versions,
 };
 
+fn output_plan(serialization: usize) -> rustls::OutputStoragePlan {
+    use core::num::NonZeroUsize;
+    rustls::OutputStoragePlan::new(rustls::OutputStorageLimits {
+        pending_records: NonZeroUsize::new(64).unwrap(),
+        ciphertext_bytes: NonZeroUsize::new(64 * 1024).unwrap(),
+        serialization_bytes: NonZeroUsize::new(serialization).unwrap(),
+    })
+    .unwrap()
+}
+
+#[test]
+fn bounded_configuration_rejects_shared_compression_cache_before_client_hello() {
+    let provider = aws_lc_rs::default_provider();
+    let mut config =
+        make_client_config_with_versions(KeyType::Rsa2048, &[&rustls::version::TLS13], &provider);
+    config.cert_compressors.clear();
+    config.output_storage = Some(output_plan(256 * 1024));
+    config.cert_compression_cache = Arc::new(rustls::compress::CompressionCache::default());
+    assert!(matches!(
+        rustls::ClientConnection::new(Arc::new(config), "localhost".try_into().unwrap()),
+        Err(rustls::Error::OutputStorage(
+            rustls::OutputStorageError::UnsupportedConfiguration(
+                rustls::OutputStorageFeature::CertificateCompressionCache
+            )
+        ))
+    ));
+}
+
+#[test]
+fn client_hello_serialization_limit_is_installed_before_constructor_output() {
+    let provider = aws_lc_rs::default_provider();
+    let mut config =
+        make_client_config_with_versions(KeyType::Rsa2048, &[&rustls::version::TLS13], &provider);
+    config.cert_compressors.clear();
+    config.cert_compression_cache = Arc::new(rustls::compress::CompressionCache::Disabled);
+    config.output_storage = Some(output_plan(1));
+    assert!(matches!(
+        rustls::ClientConnection::new(Arc::new(config), "localhost".try_into().unwrap()),
+        Err(rustls::Error::OutputStorage(
+            rustls::OutputStorageError::Limit
+        ))
+    ));
+}
+
+#[test]
+fn bounded_verified_handshake_preserves_both_protocol_versions_and_wire_frontiers() {
+    for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+        let provider = aws_lc_rs::default_provider();
+        let mut client = make_client_config_with_versions(KeyType::Rsa2048, &[version], &provider);
+        let mut server = make_server_config_with_versions(KeyType::Rsa2048, &[version], &provider);
+        client.cert_compressors.clear();
+        server.cert_compressors.clear();
+        client.cert_compression_cache = Arc::new(rustls::compress::CompressionCache::Disabled);
+        server.cert_compression_cache = Arc::new(rustls::compress::CompressionCache::Disabled);
+        client.output_storage = Some(output_plan(256 * 1024));
+        server.output_storage = Some(output_plan(256 * 1024));
+        let (mut client, mut server) = make_pair_for_configs(client, server);
+        do_handshake(&mut client, &mut server);
+        while server.wants_write() {
+            server
+                .write_tls(&mut io::sink())
+                .unwrap();
+        }
+        server
+            .enable_write_tracking(WriteTrackingLimits {
+                max_pending_records: 64,
+            })
+            .unwrap();
+        server
+            .writer()
+            .write_all(b"funded")
+            .unwrap();
+        assert_eq!(
+            server
+                .write_progress()
+                .unwrap()
+                .written_plaintext,
+            0
+        );
+        server
+            .write_tls(&mut io::sink())
+            .unwrap();
+        let progress = server.write_progress().unwrap();
+        assert_eq!(progress.written_plaintext, 6);
+        assert_eq!(progress.complete_records_plaintext, 6);
+        assert_eq!(progress.fault, None);
+    }
+}
+
 fn established(suite: SupportedCipherSuite, records: usize) -> ServerConnection {
     established_pair(suite, records).1
 }
