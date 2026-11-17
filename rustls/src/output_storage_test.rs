@@ -85,3 +85,18 @@ fn bounded_sink_never_grows_on_overrun_or_bad_backpatch() {
     count.overwrite(1, &[1]);
     assert!(count.finish().is_err());
 }
+
+#[test]
+fn counting_refuses_truncated_protocol_lengths_before_allocating_output() {
+    use crate::msgs::base::{MaybeEmpty, PayloadU8, PayloadU16};
+
+    let mut count = crate::msgs::codec::CountingEncoder::default();
+    PayloadU8::<MaybeEmpty>::new(alloc::vec![0; 256]).encode(&mut count);
+    assert!(count.finish().is_err());
+    let mut count = crate::msgs::codec::CountingEncoder::default();
+    PayloadU16::<MaybeEmpty>::new(alloc::vec![0; 65536]).encode(&mut count);
+    assert!(count.finish().is_err());
+    let mut count = crate::msgs::codec::CountingEncoder::default();
+    crate::msgs::codec::u24(0x0100_0000).encode(&mut count);
+    assert!(count.finish().is_err());
+}
