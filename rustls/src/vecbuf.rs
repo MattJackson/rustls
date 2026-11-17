@@ -1,5 +1,5 @@
+use crate::output_storage::{OutputBuffer, OutputStorageError};
 use alloc::collections::VecDeque;
-use alloc::vec::Vec;
 use core::{cmp, mem};
 #[cfg(feature = "std")]
 use std::io;
@@ -41,7 +41,8 @@ pub(crate) struct ChunkVecBuffer {
     /// Invariant: 0 <= `prefix_used` < `chunks[0].len()`
     prefix_used: usize,
 
-    chunks: VecDeque<Vec<u8>>,
+    chunks: VecDeque<OutputBuffer>,
+    max_chunks: Option<usize>,
 
     /// The total upper limit (in bytes) of this object.
     limit: Option<usize>,
@@ -52,8 +53,20 @@ impl ChunkVecBuffer {
         Self {
             prefix_used: 0,
             chunks: VecDeque::new(),
+            max_chunks: None,
             limit,
         }
+    }
+
+    pub(crate) fn reserve_chunks(&mut self, count: usize) -> Result<(), OutputStorageError> {
+        if !self.chunks.is_empty() {
+            return Err(OutputStorageError::Integrity);
+        }
+        self.chunks
+            .try_reserve_exact(count)
+            .map_err(|_| OutputStorageError::Limit)?;
+        self.max_chunks = Some(count);
+        Ok(())
     }
 
     /// Sets the upper limit on how many bytes this
@@ -98,10 +111,17 @@ impl ChunkVecBuffer {
     }
 
     /// Take and append the given `bytes`.
-    pub(crate) fn append(&mut self, bytes: Vec<u8>) -> usize {
+    pub(crate) fn append(&mut self, bytes: impl Into<OutputBuffer>) -> usize {
+        let bytes = bytes.into();
         let len = bytes.len();
 
         if !bytes.is_empty() {
+            if self
+                .max_chunks
+                .is_some_and(|max| self.chunks.len() >= max)
+            {
+                return 0;
+            }
             if self.chunks.is_empty() {
                 debug_assert_eq!(self.prefix_used, 0);
             }
@@ -115,13 +135,13 @@ impl ChunkVecBuffer {
     /// Take one of the chunks from this object.
     ///
     /// This function returns `None` if the object `is_empty`.
-    pub(crate) fn pop(&mut self) -> Option<Vec<u8>> {
+    pub(crate) fn pop(&mut self) -> Option<OutputBuffer> {
         let mut first = self.chunks.pop_front();
 
         if let Some(first) = &mut first {
             // slice off `prefix_used` if needed (uncommon)
             let prefix = mem::take(&mut self.prefix_used);
-            first.drain(0..prefix);
+            first.discard_prefix(prefix);
         }
 
         first

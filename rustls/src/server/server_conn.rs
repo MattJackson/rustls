@@ -295,6 +295,9 @@ impl<'a> ClientHello<'a> {
 /// [`ServerSessionMemoryCache`]: crate::server::handy::ServerSessionMemoryCache
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
+    /// Optional requested-layout output plan; validate before connection construction.
+    pub output_storage: Option<crate::OutputStoragePlan>,
+
     /// Source of randomness and other crypto.
     pub(super) provider: Arc<CryptoProvider>,
 
@@ -462,6 +465,18 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
+    /// Validate the bounded outgoing profile without allocating handshake output.
+    pub fn validate_output_storage(&self) -> Result<(), crate::OutputStorageError> {
+        if self.output_storage.is_none() {
+            return Ok(());
+        }
+        crate::output_storage::validate_compression(
+            &self.cert_compressors,
+            &self.cert_compression_cache,
+        )?;
+        Ok(())
+    }
+
     /// Create a builder for a server configuration with
     /// [the process-default `CryptoProvider`][CryptoProvider#using-the-per-process-default-cryptoprovider]
     /// and safe protocol version defaults.
@@ -959,6 +974,9 @@ pub struct UnbufferedServerConnection {
 impl UnbufferedServerConnection {
     /// Make a new ServerConnection. `config` controls how we behave in the TLS protocol.
     pub fn new(config: Arc<ServerConfig>) -> Result<Self, Error> {
+        if config.output_storage.is_some() {
+            return Err(crate::OutputStorageError::UnsupportedProvider.into());
+        }
         Ok(Self {
             inner: UnbufferedConnectionCommon::from(ConnectionCore::for_server(
                 config,
@@ -1008,7 +1026,7 @@ impl DerefMut for UnbufferedServerConnection {
 }
 
 impl UnbufferedConnectionCommon<ServerConnectionData> {
-    pub(crate) fn pop_early_data(&mut self) -> Option<Vec<u8>> {
+    pub(crate) fn pop_early_data(&mut self) -> Option<crate::output_storage::OutputBuffer> {
         self.core.data.early_data.pop()
     }
 
@@ -1061,6 +1079,9 @@ impl Accepted {
         mut self,
         config: Arc<ServerConfig>,
     ) -> Result<ServerConnection, (Error, AcceptedAlert)> {
+        if let Err(error) = config.validate_output_storage() {
+            return Err((error.into(), AcceptedAlert::empty()));
+        }
         if let Err(err) = self
             .connection
             .set_max_fragment_size(config.max_fragment_size)
@@ -1068,6 +1089,13 @@ impl Accepted {
             // We have a connection here, but it won't contain an alert since the error
             // is with the fragment size configured in the `ServerConfig`.
             return Err((err, AcceptedAlert::empty()));
+        }
+
+        if let Err(error) = self
+            .connection
+            .install_output_storage(config.output_storage)
+        {
+            return Err((error, AcceptedAlert::empty()));
         }
 
         self.connection.enable_secret_extraction = config.enable_secret_extraction;
@@ -1080,6 +1108,10 @@ impl Accepted {
             Ok(new) => new,
             Err(err) => return Err((err, AcceptedAlert::from(self.connection))),
         };
+
+        if let Err(error) = self.connection.check_tracking() {
+            return Err((error, AcceptedAlert::from(self.connection)));
+        }
 
         self.connection.replace_state(new);
         Ok(ServerConnection {
@@ -1164,7 +1196,7 @@ impl EarlyDataState {
         }
     }
 
-    fn pop(&mut self) -> Option<Vec<u8>> {
+    fn pop(&mut self) -> Option<crate::output_storage::OutputBuffer> {
         match self {
             Self::Accepted { received, .. } => received.pop(),
             _ => None,
@@ -1223,8 +1255,10 @@ impl ConnectionCore<ServerConnectionData> {
         config: Arc<ServerConfig>,
         extra_exts: ServerExtensionsInput<'static>,
     ) -> Result<Self, Error> {
+        config.validate_output_storage()?;
         let mut common = CommonState::new(Side::Server);
         common.set_max_fragment_size(config.max_fragment_size)?;
+        common.install_output_storage(config.output_storage)?;
         common.enable_secret_extraction = config.enable_secret_extraction;
         common.fips = config.fips();
         Ok(Self::new(

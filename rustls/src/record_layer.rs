@@ -36,6 +36,46 @@ pub(crate) struct RecordLayer {
 }
 
 impl RecordLayer {
+    pub(crate) fn output_storage_bytes(&self, len: usize) -> Option<usize> {
+        self.message_encrypter
+            .output_storage_bytes(len)
+    }
+
+    pub(crate) fn encrypt_reserved(
+        &mut self,
+        plain: OutboundPlainMessage<'_>,
+        buffer: crate::output_storage::OutputBuffer,
+    ) -> Result<crate::output_storage::OutputBuffer, Error> {
+        if self.encrypt_state != DirectionState::Active
+            || self.next_pre_encrypt_action() == PreEncryptAction::Refuse
+        {
+            return Err(Error::EncryptError);
+        }
+        let required = self
+            .output_storage_bytes(plain.payload.len())
+            .ok_or(crate::OutputStorageError::UnsupportedProvider)?;
+        if required != buffer.requested_capacity() {
+            return Err(crate::OutputStorageError::Integrity.into());
+        }
+        let (bytes, reservation) = buffer.into_parts();
+        let payload = crate::msgs::message::PrefixedPayload::from_reserved(bytes, required)?;
+        let seq = self.write_seq;
+        self.write_seq = seq
+            .checked_add(1)
+            .ok_or(Error::EncryptError)?;
+        // The consumed payload is destroyed by the provider before an error releases reservation.
+        let encrypted = self
+            .message_encrypter
+            .encrypt_with_buffer(plain, seq, payload)?;
+        let encoded = encrypted.encode();
+        if encoded.len() != required {
+            return Err(crate::OutputStorageError::Integrity.into());
+        }
+        Ok(crate::output_storage::OutputBuffer::from_parts(
+            encoded,
+            reservation,
+        ))
+    }
     pub(crate) fn plaintext_ciphertext_range(&self, len: usize) -> Option<core::ops::Range<usize>> {
         self.message_encrypter
             .plaintext_ciphertext_range(len)

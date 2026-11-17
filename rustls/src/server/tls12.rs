@@ -184,7 +184,7 @@ mod client_hello {
             cx.common.kx_state = KxState::Start(selected_kxg);
             cx.common.handshake_kind = Some(HandshakeKind::Full);
 
-            let mut flight = HandshakeFlightTls12::new(&mut self.transcript);
+            let mut flight = HandshakeFlightTls12::new(&mut self.transcript, cx.common);
 
             self.send_ticket = emit_server_hello(
                 &mut flight,
@@ -258,7 +258,7 @@ mod client_hello {
             }
 
             self.session_id = *id;
-            let mut flight = HandshakeFlightTls12::new(&mut self.transcript);
+            let mut flight = HandshakeFlightTls12::new(&mut self.transcript, cx.common);
             self.send_ticket = emit_server_hello(
                 &mut flight,
                 &self.config,
@@ -375,10 +375,11 @@ mod client_hello {
         let kx = selected_group.start()?;
         let kx_params = ServerKeyExchangeParams::new(&*kx);
 
-        let mut msg = Vec::new();
-        msg.extend(randoms.client);
-        msg.extend(randoms.server);
-        kx_params.encode(&mut msg);
+        let msg = flight.encode_output(|out| {
+            out.extend_from_slice(&randoms.client);
+            out.extend_from_slice(&randoms.server);
+            kx_params.encode(out);
+        })?;
 
         let signer = signing_key
             .choose_scheme(&sigschemes)
@@ -798,12 +799,11 @@ fn emit_ticket(
 
     let m = Message {
         version: ProtocolVersion::TLSv1_2,
-        payload: MessagePayload::handshake(HandshakeMessagePayload(
-            HandshakePayload::NewSessionTicket(NewSessionTicketPayload::new(
-                ticket_lifetime,
-                ticket,
-            )),
-        )),
+        payload: cx
+            .common
+            .handshake(HandshakeMessagePayload(HandshakePayload::NewSessionTicket(
+                NewSessionTicketPayload::new(ticket_lifetime, ticket),
+            ))),
     };
 
     transcript.add_message(&m);
@@ -827,11 +827,11 @@ fn emit_finished(
 ) {
     let vh = transcript.current_hash();
     let verify_data = secrets.server_verify_data(&vh);
-    let verify_data_payload = Payload::new(verify_data);
+    let verify_data_payload = Payload::Borrowed(&verify_data);
 
     let f = Message {
         version: ProtocolVersion::TLSv1_2,
-        payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::Finished(
+        payload: common.handshake(HandshakeMessagePayload(HandshakePayload::Finished(
             verify_data_payload,
         ))),
     };

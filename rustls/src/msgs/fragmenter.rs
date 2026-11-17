@@ -18,6 +18,9 @@ impl Default for MessageFragmenter {
 }
 
 impl MessageFragmenter {
+    pub(crate) fn maximum_plaintext(&self) -> usize {
+        self.max_frag
+    }
     /// Take `msg` and fragment it into new messages with the same type and version.
     ///
     /// Each returned message size is no more than `max_frag`.

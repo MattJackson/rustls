@@ -1,6 +1,5 @@
 //! Unbuffered connection API
 
-use alloc::vec::Vec;
 use core::num::NonZeroUsize;
 use core::{fmt, mem};
 #[cfg(feature = "std")]
@@ -10,6 +9,7 @@ use super::UnbufferedConnectionCommon;
 use crate::Error;
 use crate::client::ClientConnectionData;
 use crate::msgs::deframer::buffers::DeframerSliceBuffer;
+use crate::output_storage::OutputBuffer;
 use crate::server::ServerConnectionData;
 
 impl UnbufferedConnectionCommon<ClientConnectionData> {
@@ -332,7 +332,7 @@ pub struct ReadTraffic<'c, 'i, Data> {
 
     // owner of the latest chunk obtained in `next_record`, as borrowed by
     // `AppDataRecord`
-    chunk: Option<Vec<u8>>,
+    chunk: Option<OutputBuffer>,
 }
 
 impl<'c, 'i, Data> ReadTraffic<'c, 'i, Data> {
@@ -383,7 +383,7 @@ pub struct ReadEarlyData<'c, 'i, Data> {
 
     // owner of the latest chunk obtained in `next_record`, as borrowed by
     // `AppDataRecord`
-    chunk: Option<Vec<u8>>,
+    chunk: Option<OutputBuffer>,
 }
 
 impl<'c, 'i> ReadEarlyData<'c, 'i, ServerConnectionData> {
@@ -490,11 +490,11 @@ impl<Data> WriteTraffic<'_, Data> {
 /// A handshake record must be encoded
 pub struct EncodeTlsData<'c, Data> {
     conn: &'c mut UnbufferedConnectionCommon<Data>,
-    chunk: Option<Vec<u8>>,
+    chunk: Option<OutputBuffer>,
 }
 
 impl<'c, Data> EncodeTlsData<'c, Data> {
-    fn new(conn: &'c mut UnbufferedConnectionCommon<Data>, chunk: Vec<u8>) -> Self {
+    fn new(conn: &'c mut UnbufferedConnectionCommon<Data>, chunk: OutputBuffer) -> Self {
         Self {
             conn,
             chunk: Some(chunk),
