@@ -9,6 +9,27 @@ use std::io::Read;
 #[cfg(feature = "std")]
 use crate::msgs::message::OutboundChunks;
 
+#[cfg(feature = "std")]
+#[derive(Debug)]
+pub(crate) struct InvalidWriteCount {
+    used: usize,
+    available: usize,
+}
+
+#[cfg(feature = "std")]
+impl core::fmt::Display for InvalidWriteCount {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "illegal write_vectored return value ({} > {})",
+            self.used, self.available
+        )
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for InvalidWriteCount {}
+
 /// This is a byte buffer that is built from a deque of byte vectors.
 ///
 /// This avoids extra copies when appending a new byte vector,
@@ -44,6 +65,11 @@ impl ChunkVecBuffer {
     /// A [`None`] limit is interpreted as no limit.
     pub(crate) fn set_limit(&mut self, new_limit: Option<usize>) {
         self.limit = new_limit;
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn has_limit(&self) -> bool {
+        self.limit.is_some()
     }
 
     /// If we're empty
@@ -215,7 +241,10 @@ impl ChunkVecBuffer {
             self.consume(available_bytes);
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                std::format!("illegal write_vectored return value ({used} > {available_bytes})"),
+                InvalidWriteCount {
+                    used,
+                    available: available_bytes,
+                },
             ));
         }
         self.consume(used);

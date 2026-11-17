@@ -62,7 +62,10 @@ mod connection {
         ///
         /// See [`ConnectionCommon::write_tls()`] for more information.
         pub fn write_tls(&mut self, wr: &mut dyn io::Write) -> Result<usize, io::Error> {
-            self.sendable_tls.write_to(wr)
+            match self {
+                Self::Client(conn) => conn.write_tls(wr),
+                Self::Server(conn) => conn.write_tls(wr),
+            }
         }
 
         /// Returns an object that allows reading plaintext.
@@ -360,6 +363,9 @@ https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof"
     impl<T> ConnectionCommon<T> {
         /// Return the fatal error this connection previously encountered, if any.
         fn check_error(&self) -> io::Result<()> {
+            if let Some(fault) = self.tracking_fault() {
+                return Err(fault.io_error());
+            }
             match &self.core.state {
                 Ok(_) => Ok(()),
                 Err(err) => Err(io::Error::new(io::ErrorKind::InvalidData, err.clone())),
@@ -376,7 +382,10 @@ https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof"
                     .core
                     .common_state
                     .buffer_plaintext(payload.split_at(len).1, &mut self.sendable_plaintext);
-                if !self.core.maybe_refresh_traffic_keys() || len == payload.len() {
+                if self.tracking_fault().is_some()
+                    || !self.core.maybe_refresh_traffic_keys()
+                    || len == payload.len()
+                {
                     return len;
                 }
             }
@@ -386,7 +395,11 @@ https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof"
     impl<T> PlaintextSink for ConnectionCommon<T> {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.check_error()?;
-            Ok(self.send_plaintext(buf.into()))
+            let len = self.send_plaintext(buf.into());
+            if len == 0 {
+                self.check_error()?;
+            }
+            Ok(len)
         }
 
         fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
@@ -404,7 +417,11 @@ https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof"
                     OutboundChunks::new(&payload_owner)
                 }
             };
-            Ok(self.send_plaintext(payload))
+            let len = self.send_plaintext(payload);
+            if len == 0 {
+                self.check_error()?;
+            }
+            Ok(len)
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -459,8 +476,12 @@ impl<Data> ConnectionCommon<Data> {
     /// [`process_new_packets`]: Connection::process_new_packets
     #[inline]
     pub fn process_new_packets(&mut self) -> Result<IoState, Error> {
-        self.core
-            .process_new_packets(&mut self.deframer_buffer, &mut self.sendable_plaintext)
+        self.check_tracking()?;
+        let result = self
+            .core
+            .process_new_packets(&mut self.deframer_buffer, &mut self.sendable_plaintext);
+        self.check_tracking()?;
+        result
     }
 
     /// Derives key material from the agreed connection secrets.
@@ -541,6 +562,12 @@ impl<Data> ConnectionCommon<Data> {
     /// [`Connection::write_tls`]: crate::Connection::write_tls
     /// [`Connection::process_new_packets`]: crate::Connection::process_new_packets
     pub fn set_buffer_limit(&mut self, limit: Option<usize>) {
+        if limit.is_none() {
+            if let Some(tracker) = &mut self.write_tracking {
+                tracker.fault(crate::WriteTrackingFault::Limit);
+                return;
+            }
+        }
         self.sendable_plaintext.set_limit(limit);
         self.sendable_tls.set_limit(limit);
     }
@@ -810,7 +837,72 @@ impl<Data> ConnectionCommon<Data> {
     /// After this function returns, the connection buffer may not yet be fully flushed. The
     /// [`CommonState::wants_write`] function can be used to check if the output buffer is empty.
     pub fn write_tls(&mut self, wr: &mut dyn io::Write) -> Result<usize, io::Error> {
-        self.sendable_tls.write_to(wr)
+        if let Some(fault) = self.tracking_fault() {
+            return Err(fault.io_error());
+        }
+        let nonempty = !self.sendable_tls.is_empty();
+        let result = self.sendable_tls.write_to(wr);
+        let Some(tracker) = &mut self.write_tracking else {
+            return result;
+        };
+        match result {
+            Ok(0) if nonempty => {
+                let fault = crate::WriteTrackingFault::WriteZero;
+                tracker.fault(fault);
+                Err(fault.io_error())
+            }
+            Ok(count) => match tracker.consume(count) {
+                Ok(()) => Ok(count),
+                Err(fault) => {
+                    tracker.fault(fault);
+                    Err(fault.io_error())
+                }
+            },
+            Err(error) => {
+                if error
+                    .get_ref()
+                    .is_some_and(|source| source.is::<crate::vecbuf::InvalidWriteCount>())
+                {
+                    tracker.fault(crate::WriteTrackingFault::Integrity);
+                } else if !matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) {
+                    tracker.fault(crate::WriteTrackingFault::Io);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Enable bounded output provenance after handshake and before any application output.
+    ///
+    /// A tracked connection cannot be extracted for kernel/offloaded IO. Tracking does not
+    /// prove that the writer subsequently supplied to `write_tls` is an actual socket.
+    pub fn enable_write_tracking(
+        &mut self,
+        limits: crate::WriteTrackingLimits,
+    ) -> Result<(), crate::WriteTrackingError> {
+        use crate::WriteTrackingError;
+        if self.write_tracking.is_some() || self.application_data_sent {
+            return Err(WriteTrackingError::AlreadyStarted);
+        }
+        if self.is_handshaking()
+            || self.early_traffic
+            || !self.may_send_application_data
+            || !self.sendable_plaintext.is_empty()
+            || self.protocol != crate::common_state::Protocol::Tcp
+        {
+            return Err(WriteTrackingError::IncompatibleState);
+        }
+        if !self.sendable_tls.has_limit() {
+            return Err(WriteTrackingError::Capacity);
+        }
+        self.write_tracking = Some(crate::write_tracking::WriteTracker::new(
+            limits,
+            self.sendable_tls.len(),
+        )?);
+        Ok(())
     }
 }
 
@@ -1225,6 +1317,15 @@ impl<Data> ConnectionCore<Data> {
     pub(crate) fn dangerous_into_kernel_connection(
         self,
     ) -> Result<(ExtractedSecrets, KernelConnection<Data>), Error> {
+        if self
+            .common_state
+            .write_tracking
+            .is_some()
+        {
+            return Err(Error::General(
+                "tracked TLS output cannot be extracted".into(),
+            ));
+        }
         if !self
             .common_state
             .enable_secret_extraction
@@ -1294,10 +1395,13 @@ impl<Data> ConnectionCore<Data> {
     }
 
     fn refresh_traffic_keys(&mut self) -> Result<(), Error> {
-        match &mut self.state {
+        self.common_state.check_tracking()?;
+        let result = match &mut self.state {
             Ok(st) => st.send_key_update_request(&mut self.common_state),
             Err(e) => Err(e.clone()),
-        }
+        };
+        self.common_state.check_tracking()?;
+        result
     }
 }
 

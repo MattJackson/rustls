@@ -36,6 +36,30 @@ pub(crate) struct RecordLayer {
 }
 
 impl RecordLayer {
+    pub(crate) fn plaintext_ciphertext_range(&self, len: usize) -> Option<core::ops::Range<usize>> {
+        self.message_encrypter
+            .plaintext_ciphertext_range(len)
+    }
+
+    /// Tracking must handle provider failures before the legacy infallible wrapper unwraps.
+    /// A consumed sequence is never rolled back, including when encryption fails.
+    pub(crate) fn try_encrypt_outgoing(
+        &mut self,
+        plain: OutboundPlainMessage<'_>,
+    ) -> Result<OutboundOpaqueMessage, Error> {
+        if self.encrypt_state != DirectionState::Active
+            || self.next_pre_encrypt_action() == PreEncryptAction::Refuse
+        {
+            return Err(Error::EncryptError);
+        }
+        let seq = self.write_seq;
+        self.write_seq = seq
+            .checked_add(1)
+            .ok_or(Error::EncryptError)?;
+        self.message_encrypter
+            .encrypt(plain, seq)
+    }
+
     /// Create new record layer with no keys.
     pub(crate) fn new() -> Self {
         Self {

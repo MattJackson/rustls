@@ -449,6 +449,7 @@ mod vecbuf;
 mod verify;
 #[cfg(test)]
 mod verifybench;
+mod write_tracking;
 mod x509;
 #[macro_use]
 mod check;
@@ -577,6 +578,9 @@ pub use crate::tls13::Tls13CipherSuite;
 pub use crate::verify::DigitallySignedStruct;
 pub use crate::versions::{ALL_VERSIONS, DEFAULT_VERSIONS, SupportedProtocolVersion};
 pub use crate::webpki::RootCertStore;
+pub use crate::write_tracking::{
+    WriteProgress, WriteTrackingError, WriteTrackingFault, WriteTrackingLimits,
+};
 
 /// Items for use in a client.
 pub mod client {
