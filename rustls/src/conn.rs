@@ -887,7 +887,9 @@ impl<Data> ConnectionCommon<Data> {
         if self.write_tracking.is_some() || self.application_data_sent {
             return Err(WriteTrackingError::AlreadyStarted);
         }
-        if self.is_handshaking()
+        if self.core.state.is_err()
+            || self.has_sent_close_notify
+            || self.is_handshaking()
             || self.early_traffic
             || !self.may_send_application_data
             || !self.sendable_plaintext.is_empty()
