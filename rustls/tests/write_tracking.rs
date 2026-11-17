@@ -908,3 +908,19 @@ fn deferred_server_constructor_validates_funded_profile_before_output() {
         ))
     ));
 }
+
+#[test]
+fn funded_vectored_writer_skips_empty_slices_before_fixed_stack_batch() {
+    let provider = aws_lc_rs::default_provider();
+    let versions = &[&rustls::version::TLS13];
+    let client_config = make_client_config_with_versions(KeyType::Rsa2048, versions, &provider);
+    let mut server_config = make_server_config_with_versions(KeyType::Rsa2048, versions, &provider);
+    server_config.cert_compressors.clear();
+    server_config.cert_compression_cache = Arc::new(rustls::compress::CompressionCache::Disabled);
+    server_config.output_storage = Some(output_plan(256 * 1024));
+    let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+    do_handshake(&mut client, &mut server);
+    let mut slices = [IoSlice::new(&[]); 66];
+    slices[65] = IoSlice::new(b"data");
+    assert_eq!(server.writer().write_vectored(&slices).unwrap(), 4);
+}
