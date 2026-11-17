@@ -523,13 +523,9 @@ impl ServerConfig {
         // 2. that the process-level default provider is usable with the supplied protocol versions.
         Self::builder_with_provider(
             CryptoProvider::get_default_or_install_from_crate_features().clone(),
-        )?;
-        if self.ticketer.enabled() && !self.ticketer.supports_bounded_output() {
-            return Err(crate::OutputStorageError::UnsupportedProvider);
-        }
-        Ok(())
-            .with_protocol_versions(versions)
-            .unwrap()
+        )
+        .with_protocol_versions(versions)
+        .unwrap()
     }
 
     /// Create a builder for a server configuration with a specific [`CryptoProvider`].
