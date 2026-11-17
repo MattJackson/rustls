@@ -272,6 +272,7 @@ struct FailureSwitch {
     armed: AtomicBool,
     remaining: AtomicUsize,
     sequences: Mutex<Vec<u64>>,
+    mapping: AtomicUsize,
 }
 
 struct FailingAead {
@@ -311,8 +312,17 @@ struct FailingEncrypter {
 
 impl MessageEncrypter for FailingEncrypter {
     fn plaintext_ciphertext_range(&self, len: usize) -> Option<std::ops::Range<usize>> {
-        self.inner
-            .plaintext_ciphertext_range(len)
+        match self
+            .switch
+            .mapping
+            .load(Ordering::SeqCst)
+        {
+            1 => None,
+            2 => Some(0..len + 1),
+            _ => self
+                .inner
+                .plaintext_ciphertext_range(len),
+        }
     }
 
     fn encrypted_payload_len(&self, len: usize) -> usize {
@@ -446,6 +456,88 @@ fn control_encryption_failure_is_latched_without_panicking_or_retrying_alerts() 
         );
         assert_eq!(switch.sequences.lock().unwrap().len(), 1);
     }
+}
+
+#[test]
+fn unavailable_or_invalid_provider_mapping_refuses_before_output() {
+    for (mapping, fault) in [
+        (1, WriteTrackingFault::Unsupported),
+        (2, WriteTrackingFault::Integrity),
+    ] {
+        let (mut server, switch) = failing_connection();
+        switch
+            .mapping
+            .store(mapping, Ordering::SeqCst);
+        switch
+            .armed
+            .store(true, Ordering::SeqCst);
+        assert!(server.writer().write(b"body").is_err());
+        assert_eq!(
+            server
+                .write_progress()
+                .unwrap()
+                .accepted_plaintext,
+            0
+        );
+        assert_eq!(server.write_progress().unwrap().fault, Some(fault));
+        assert!(
+            server
+                .write_tls(&mut io::sink())
+                .is_err()
+        );
+        assert!(
+            switch
+                .sequences
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn key_update_and_multiple_application_records_keep_logical_order() {
+    let mut server = established(cipher_suite::TLS13_AES_128_GCM_SHA256, 4);
+    server.refresh_traffic_keys().unwrap();
+    let mut control = Prefix {
+        limit: usize::MAX,
+        bytes: Vec::new(),
+    };
+    server.write_tls(&mut control).unwrap();
+    assert!(!control.bytes.is_empty());
+    assert_eq!(
+        server
+            .write_progress()
+            .unwrap()
+            .written_plaintext,
+        0
+    );
+    server
+        .writer()
+        .write_all(b"head")
+        .unwrap();
+    server
+        .writer()
+        .write_all(b"body")
+        .unwrap();
+    let mut raw = Prefix {
+        limit: 26 + 6,
+        bytes: Vec::new(),
+    };
+    assert_eq!(server.write_tls(&mut raw).unwrap(), 32);
+    let progress = server.write_progress().unwrap();
+    assert_eq!(progress.accepted_plaintext, 8);
+    assert_eq!(progress.written_plaintext, 5);
+    assert_eq!(progress.complete_records_plaintext, 4);
+    raw.limit = usize::MAX;
+    server.write_tls(&mut raw).unwrap();
+    assert_eq!(
+        server
+            .write_progress()
+            .unwrap()
+            .complete_records_plaintext,
+        8
+    );
 }
 
 #[test]
