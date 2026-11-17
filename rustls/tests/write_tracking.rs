@@ -740,3 +740,171 @@ fn pending_is_distinct_from_oversized_writer_return_and_error_keeps_progress() {
         );
     }
 }
+
+#[test]
+fn bounded_configuration_refuses_compressor_before_provider_call() {
+    #[derive(Debug)]
+    struct NeverCompress;
+    impl rustls::compress::CertCompressor for NeverCompress {
+        fn compress(
+            &self,
+            _: Vec<u8>,
+            _: rustls::compress::CompressionLevel,
+        ) -> Result<Vec<u8>, rustls::compress::CompressionFailed> {
+            panic!("funded constructor invoked an unsupported compressor");
+        }
+        fn algorithm(&self) -> rustls::CertificateCompressionAlgorithm {
+            rustls::CertificateCompressionAlgorithm::Brotli
+        }
+    }
+    static COMPRESSOR: NeverCompress = NeverCompress;
+    let provider = aws_lc_rs::default_provider();
+    let mut config =
+        make_client_config_with_versions(KeyType::Rsa2048, &[&rustls::version::TLS13], &provider);
+    config.cert_compressors = vec![&COMPRESSOR];
+    config.cert_compression_cache = Arc::new(rustls::compress::CompressionCache::Disabled);
+    config.output_storage = Some(output_plan(256 * 1024));
+    assert!(matches!(
+        rustls::ClientConnection::new(Arc::new(config), "localhost".try_into().unwrap()),
+        Err(rustls::Error::OutputStorage(
+            rustls::OutputStorageError::UnsupportedConfiguration(
+                rustls::OutputStorageFeature::CertificateCompression
+            )
+        ))
+    ));
+}
+
+#[test]
+fn bounded_ech_enable_and_grease_refuse_before_hpke_operation() {
+    use rustls::client::{EchConfig, EchGreaseConfig, EchMode};
+    use rustls::crypto::hpke::{
+        EncapsulatedSecret, Hpke, HpkeOpener, HpkePrivateKey, HpkePublicKey, HpkeSealer, HpkeSuite,
+    };
+    use rustls::internal::msgs::base::PayloadU16;
+    use rustls::internal::msgs::codec::Codec;
+    use rustls::internal::msgs::handshake::{
+        EchConfigContents, EchConfigPayload, HpkeKeyConfig, HpkeSymmetricCipherSuite,
+    };
+    use rustls::pki_types::{DnsName, EchConfigListBytes};
+
+    #[derive(Debug)]
+    struct NoHpkeOutput;
+    impl Hpke for NoHpkeOutput {
+        fn seal(
+            &self,
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+            _: &HpkePublicKey,
+        ) -> Result<(EncapsulatedSecret, Vec<u8>), rustls::Error> {
+            panic!("HPKE seal ran before funded profile refusal");
+        }
+        fn setup_sealer(
+            &self,
+            _: &[u8],
+            _: &HpkePublicKey,
+        ) -> Result<(EncapsulatedSecret, Box<dyn HpkeSealer>), rustls::Error> {
+            panic!("HPKE setup ran before funded profile refusal");
+        }
+        fn open(
+            &self,
+            _: &EncapsulatedSecret,
+            _: &[u8],
+            _: &[u8],
+            _: &[u8],
+            _: &HpkePrivateKey,
+        ) -> Result<Vec<u8>, rustls::Error> {
+            panic!("HPKE open ran before funded profile refusal");
+        }
+        fn setup_opener(
+            &self,
+            _: &EncapsulatedSecret,
+            _: &[u8],
+            _: &HpkePrivateKey,
+        ) -> Result<Box<dyn HpkeOpener>, rustls::Error> {
+            panic!("HPKE opener ran before funded profile refusal");
+        }
+        fn generate_key_pair(&self) -> Result<(HpkePublicKey, HpkePrivateKey), rustls::Error> {
+            panic!("HPKE generation ran before funded profile refusal");
+        }
+        fn suite(&self) -> HpkeSuite {
+            aws_lc_rs::hpke::ALL_SUPPORTED_SUITES[0].suite()
+        }
+    }
+    static HPKE: NoHpkeOutput = NoHpkeOutput;
+    let (public_key, _) = aws_lc_rs::hpke::ALL_SUPPORTED_SUITES[0]
+        .generate_key_pair()
+        .unwrap();
+    let suite = HPKE.suite();
+    let config = EchConfigPayload::V18(EchConfigContents {
+        key_config: HpkeKeyConfig {
+            config_id: 0,
+            kem_id: suite.kem,
+            public_key: PayloadU16::new(public_key.0.clone()),
+            symmetric_cipher_suites: vec![HpkeSymmetricCipherSuite {
+                kdf_id: suite.sym.kdf_id,
+                aead_id: suite.sym.aead_id,
+            }],
+        },
+        maximum_name_length: 0,
+        public_name: DnsName::try_from("localhost").unwrap(),
+        extensions: vec![],
+    });
+    let ech = EchConfig::new(
+        EchConfigListBytes::from(vec![config].get_encoding()),
+        &[&HPKE],
+    )
+    .unwrap();
+    for mode in [
+        EchMode::Enable(ech),
+        EchMode::Grease(EchGreaseConfig::new(&HPKE, public_key)),
+    ] {
+        let builder =
+            rustls::ClientConfig::builder_with_provider(aws_lc_rs::default_provider().into())
+                .with_ech(mode)
+                .unwrap();
+        let mut config = rustls_test::finish_client_config(KeyType::Rsa2048, builder);
+        config.cert_compressors.clear();
+        config.cert_compression_cache = Arc::new(rustls::compress::CompressionCache::Disabled);
+        config.output_storage = Some(output_plan(256 * 1024));
+        assert!(matches!(
+            rustls::ClientConnection::new(Arc::new(config), "localhost".try_into().unwrap()),
+            Err(rustls::Error::OutputStorage(
+                rustls::OutputStorageError::UnsupportedConfiguration(
+                    rustls::OutputStorageFeature::Ech
+                )
+            ))
+        ));
+    }
+}
+
+#[test]
+fn deferred_server_constructor_validates_funded_profile_before_output() {
+    let provider = aws_lc_rs::default_provider();
+    let client_config =
+        make_client_config_with_versions(KeyType::Rsa2048, &[&rustls::version::TLS13], &provider);
+    let mut client =
+        rustls::ClientConnection::new(Arc::new(client_config), "localhost".try_into().unwrap())
+            .unwrap();
+    let mut hello = Vec::new();
+    client.write_tls(&mut hello).unwrap();
+    let mut acceptor = rustls::server::Acceptor::default();
+    acceptor
+        .read_tls(&mut hello.as_slice())
+        .unwrap();
+    let accepted = acceptor.accept().unwrap().unwrap();
+    let mut server_config =
+        make_server_config_with_versions(KeyType::Rsa2048, &[&rustls::version::TLS13], &provider);
+    server_config.cert_compressors.clear();
+    server_config.cert_compression_cache = Arc::new(rustls::compress::CompressionCache::default());
+    server_config.output_storage = Some(output_plan(256 * 1024));
+    assert!(matches!(
+        accepted.into_connection(Arc::new(server_config)),
+        Err((
+            rustls::Error::OutputStorage(rustls::OutputStorageError::UnsupportedConfiguration(
+                rustls::OutputStorageFeature::CertificateCompressionCache
+            )),
+            _
+        ))
+    ));
+}
