@@ -347,7 +347,7 @@ impl DigitallySignedStruct {
 }
 
 impl Codec<'_> for DigitallySignedStruct {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.scheme.encode(bytes);
         self.sig.encode(bytes);
     }

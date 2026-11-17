@@ -404,6 +404,25 @@ https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof"
 
         fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
             self.check_error()?;
+            if self.output_storage.is_some() {
+                let mut slices = [&[][..]; 64];
+                let mut count = 0;
+                for (out, input) in slices.iter_mut().zip(
+                    bufs.iter()
+                        .filter(|input| !input.is_empty()),
+                ) {
+                    *out = input.deref();
+                    count += 1;
+                }
+                if count == 0 {
+                    return Ok(0);
+                }
+                let len = self.send_plaintext(OutboundChunks::new(&slices[..count]));
+                if len == 0 {
+                    self.check_error()?;
+                }
+                return Ok(len);
+            }
             let payload_owner: Vec<&[u8]>;
             let payload = match bufs.len() {
                 0 => return Ok(0),
@@ -563,6 +582,10 @@ impl<Data> ConnectionCommon<Data> {
     /// [`Connection::process_new_packets`]: crate::Connection::process_new_packets
     pub fn set_buffer_limit(&mut self, limit: Option<usize>) {
         if limit.is_none() {
+            if self.output_storage.is_some() {
+                self.fail_tracking(crate::WriteTrackingFault::Limit);
+                return;
+            }
             if let Some(tracker) = &mut self.write_tracking {
                 tracker.fault(crate::WriteTrackingFault::Limit);
                 return;
@@ -842,19 +865,23 @@ impl<Data> ConnectionCommon<Data> {
         }
         let nonempty = !self.sendable_tls.is_empty();
         let result = self.sendable_tls.write_to(wr);
-        let Some(tracker) = &mut self.write_tracking else {
+        if self.write_tracking.is_none() && self.output_storage.is_none() {
             return result;
-        };
+        }
         match result {
             Ok(0) if nonempty => {
                 let fault = crate::WriteTrackingFault::WriteZero;
-                tracker.fault(fault);
+                self.fail_tracking(fault);
                 Err(fault.io_error())
             }
-            Ok(count) => match tracker.consume(count) {
+            Ok(count) => match self
+                .write_tracking
+                .as_mut()
+                .map_or(Ok(()), |tracker| tracker.consume(count))
+            {
                 Ok(()) => Ok(count),
                 Err(fault) => {
-                    tracker.fault(fault);
+                    self.fail_tracking(fault);
                     Err(fault.io_error())
                 }
             },
@@ -863,12 +890,12 @@ impl<Data> ConnectionCommon<Data> {
                     .get_ref()
                     .is_some_and(|source| source.is::<crate::vecbuf::InvalidWriteCount>())
                 {
-                    tracker.fault(crate::WriteTrackingFault::Integrity);
+                    self.fail_tracking(crate::WriteTrackingFault::Integrity);
                 } else if !matches!(
                     error.kind(),
                     io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                 ) {
-                    tracker.fault(crate::WriteTrackingFault::Io);
+                    self.fail_tracking(crate::WriteTrackingFault::Io);
                 }
                 Err(error)
             }
@@ -900,10 +927,25 @@ impl<Data> ConnectionCommon<Data> {
         if !self.sendable_tls.has_limit() {
             return Err(WriteTrackingError::Capacity);
         }
-        self.write_tracking = Some(crate::write_tracking::WriteTracker::new(
-            limits,
-            self.sendable_tls.len(),
-        )?);
+        self.write_tracking = Some(if let Some(storage) = &self.output_storage {
+            if limits.max_pending_records
+                != storage
+                    .plan()
+                    .limits()
+                    .pending_records
+                    .get()
+            {
+                return Err(WriteTrackingError::Capacity);
+            }
+            let mut tracker = self
+                .prepared_write_tracking
+                .take()
+                .ok_or(WriteTrackingError::Capacity)?;
+            tracker.reset_baseline(self.sendable_tls.len())?;
+            tracker
+        } else {
+            crate::write_tracking::WriteTracker::new(limits, self.sendable_tls.len())?
+        });
         Ok(())
     }
 }
@@ -1323,6 +1365,10 @@ impl<Data> ConnectionCore<Data> {
             .common_state
             .write_tracking
             .is_some()
+            || self
+                .common_state
+                .output_storage
+                .is_some()
         {
             return Err(Error::General(
                 "tracked TLS output cannot be extracted".into(),

@@ -236,7 +236,24 @@ impl MessageEncrypter for AeadMessageEncrypter {
         seq: u64,
     ) -> Result<OutboundOpaqueMessage, Error> {
         let total_len = self.encrypted_payload_len(msg.payload.len());
-        let mut payload = PrefixedPayload::with_capacity(total_len);
+        let payload = PrefixedPayload::with_capacity(total_len);
+        self.encrypt_with_buffer(msg, seq, payload)
+    }
+
+    fn output_storage_bytes(&self, plaintext_len: usize) -> Option<usize> {
+        plaintext_len
+            .checked_add(self.encrypted_payload_len(0))?
+            .checked_add(5)
+    }
+
+    fn encrypt_with_buffer(
+        &mut self,
+        msg: OutboundPlainMessage<'_>,
+        seq: u64,
+        mut payload: PrefixedPayload,
+    ) -> Result<OutboundOpaqueMessage, Error> {
+        let total_len = self.encrypted_payload_len(msg.payload.len());
+        payload.check_reserved_capacity(total_len)?;
 
         let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).0);
         let aad = aead::Aad::from(make_tls13_aad(total_len));
@@ -301,7 +318,24 @@ impl MessageEncrypter for GcmMessageEncrypter {
         seq: u64,
     ) -> Result<OutboundOpaqueMessage, Error> {
         let total_len = self.encrypted_payload_len(msg.payload.len());
-        let mut payload = PrefixedPayload::with_capacity(total_len);
+        let payload = PrefixedPayload::with_capacity(total_len);
+        self.encrypt_with_buffer(msg, seq, payload)
+    }
+
+    fn output_storage_bytes(&self, plaintext_len: usize) -> Option<usize> {
+        plaintext_len
+            .checked_add(self.encrypted_payload_len(0))?
+            .checked_add(5)
+    }
+
+    fn encrypt_with_buffer(
+        &mut self,
+        msg: OutboundPlainMessage<'_>,
+        seq: u64,
+        mut payload: PrefixedPayload,
+    ) -> Result<OutboundOpaqueMessage, Error> {
+        let total_len = self.encrypted_payload_len(msg.payload.len());
+        payload.check_reserved_capacity(total_len)?;
 
         let nonce = aead::Nonce::assume_unique_for_key(Nonce::new(&self.iv, seq).0);
         let aad = aead::Aad::from(make_tls13_aad(total_len));

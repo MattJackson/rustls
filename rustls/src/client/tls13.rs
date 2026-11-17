@@ -334,14 +334,49 @@ pub(super) fn fill_in_psk_binder(
     transcript: &HandshakeHashBuffer,
     hmp: &mut HandshakeMessagePayload<'_>,
 ) -> KeyScheduleEarly {
+    let binder_plaintext = hmp.encoding_for_binder_signing();
+    fill_in_psk_binder_from_encoding(resuming, transcript, hmp, &binder_plaintext)
+}
+
+pub(super) fn fill_in_psk_binder_for_connection(
+    resuming: &persist::Tls13ClientSessionValue,
+    transcript: &HandshakeHashBuffer,
+    hmp: &mut HandshakeMessagePayload<'_>,
+    common: &CommonState,
+) -> Result<KeyScheduleEarly, Error> {
+    let Some(storage) = &common.output_storage else {
+        return Ok(fill_in_psk_binder(resuming, transcript, hmp));
+    };
+    let result = (|| {
+        let mut encoded = storage.encode(|out| hmp.encode(out))?;
+        let len = encoded
+            .len()
+            .checked_sub(hmp.total_binder_length())
+            .ok_or(crate::OutputStorageError::Integrity)?;
+        encoded.truncate(len);
+        Ok(fill_in_psk_binder_from_encoding(
+            resuming, transcript, hmp, &encoded,
+        ))
+    })();
+    result.map_err(|error| {
+        storage.fault(error);
+        Error::from(error)
+    })
+}
+
+fn fill_in_psk_binder_from_encoding(
+    resuming: &persist::Tls13ClientSessionValue,
+    transcript: &HandshakeHashBuffer,
+    hmp: &mut HandshakeMessagePayload<'_>,
+    binder_plaintext: &[u8],
+) -> KeyScheduleEarly {
     // We need to know the hash function of the suite we're trying to resume into.
     let suite = resuming.suite();
     let suite_hash = suite.common.hash_provider;
 
     // The binder is calculated over the clienthello, but doesn't include itself or its
     // length, or the length of its container.
-    let binder_plaintext = hmp.encoding_for_binder_signing();
-    let handshake_hash = transcript.hash_given(suite_hash, &binder_plaintext);
+    let handshake_hash = transcript.hash_given(suite_hash, binder_plaintext);
 
     // Run a fake key_schedule to simulate what the server will do if it chooses
     // to resume.
@@ -1055,9 +1090,11 @@ impl State<ClientConnectionData> for ExpectCompressedCertificate {
 
         let m = Message {
             version: ProtocolVersion::TLSv1_3,
-            payload: MessagePayload::handshake(HandshakeMessagePayload(
-                HandshakePayload::CertificateTls13(cert_payload.into_owned()),
-            )),
+            payload: cx
+                .common
+                .handshake(HandshakeMessagePayload(HandshakePayload::CertificateTls13(
+                    cert_payload.into_owned(),
+                ))),
         };
 
         Box::new(ExpectCertificate {
@@ -1257,6 +1294,9 @@ fn emit_compressed_certificate_tls13(
     compressor: &dyn compress::CertCompressor,
     config: &ClientConfig,
 ) {
+    if flight.refuse_compression() {
+        return;
+    }
     let mut cert_payload = CertificatePayloadTls13::new(certkey.cert.iter(), None);
     cert_payload.context = PayloadU8::new(auth_context.clone().unwrap_or_default());
 
@@ -1305,7 +1345,7 @@ fn emit_certverify_tls13(
 }
 
 fn emit_finished_tls13(flight: &mut HandshakeFlightTls13<'_>, verify_data: &crypto::hmac::Tag) {
-    let verify_data_payload = Payload::new(verify_data.as_ref());
+    let verify_data_payload = Payload::Borrowed(verify_data.as_ref());
 
     flight.add(HandshakeMessagePayload(HandshakePayload::Finished(
         verify_data_payload,
@@ -1319,9 +1359,7 @@ fn emit_end_of_early_data_tls13(transcript: &mut HandshakeHash, common: &mut Com
 
     let m = Message {
         version: ProtocolVersion::TLSv1_3,
-        payload: MessagePayload::handshake(HandshakeMessagePayload(
-            HandshakePayload::EndOfEarlyData,
-        )),
+        payload: common.handshake(HandshakeMessagePayload(HandshakePayload::EndOfEarlyData)),
     };
 
     transcript.add_message(&m);
@@ -1383,7 +1421,7 @@ impl State<ClientConnectionData> for ExpectFinished {
                 .set_handshake_encrypter(cx.common);
         }
 
-        let mut flight = HandshakeFlightTls13::new(&mut st.transcript);
+        let mut flight = HandshakeFlightTls13::new(&mut st.transcript, cx.common);
 
         /* Send our authentication/finished messages.  These are still encrypted
          * with our handshake keys. */

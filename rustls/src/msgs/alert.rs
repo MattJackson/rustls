@@ -1,5 +1,3 @@
-use alloc::vec::Vec;
-
 use crate::enums::AlertDescription;
 use crate::error::InvalidMessage;
 use crate::msgs::codec::{Codec, Reader};
@@ -12,7 +10,7 @@ pub struct AlertMessagePayload {
 }
 
 impl Codec<'_> for AlertMessagePayload {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         self.level.encode(bytes);
         self.description.encode(bytes);
     }

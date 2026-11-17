@@ -4,6 +4,81 @@ use core::marker::PhantomData;
 
 use crate::error::InvalidMessage;
 
+/// The existing wire recipe can count first, then write into reserved backing.
+pub trait Encoder {
+    /// Number of wire bytes already emitted or counted.
+    fn len(&self) -> usize;
+    /// Whether no wire bytes have been emitted or counted.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Append bytes, or latch an error if bounded backing is insufficient.
+    fn extend_from_slice(&mut self, bytes: &[u8]);
+    /// Backpatch an already emitted range without extending it.
+    fn overwrite(&mut self, offset: usize, bytes: &[u8]);
+    /// Latch a malformed encoding or size overflow.
+    fn fail(&mut self);
+    /// Append one byte through the same bounded sink.
+    fn push(&mut self, byte: u8) {
+        self.extend_from_slice(&[byte]);
+    }
+}
+
+impl Encoder for Vec<u8> {
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        Vec::extend_from_slice(self, bytes);
+    }
+    fn overwrite(&mut self, offset: usize, bytes: &[u8]) {
+        if let Some(out) = offset
+            .checked_add(bytes.len())
+            .and_then(|end| self.get_mut(offset..end))
+        {
+            out.copy_from_slice(bytes);
+        }
+    }
+    fn fail(&mut self) {}
+}
+
+#[derive(Default)]
+pub(crate) struct CountingEncoder {
+    len: usize,
+    failed: bool,
+}
+impl CountingEncoder {
+    pub(crate) fn finish(self) -> Result<usize, crate::output_storage::OutputStorageError> {
+        if self.failed {
+            Err(crate::output_storage::OutputStorageError::Integrity)
+        } else {
+            Ok(self.len)
+        }
+    }
+}
+impl Encoder for CountingEncoder {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        match self.len.checked_add(bytes.len()) {
+            Some(len) => self.len = len,
+            None => self.fail(),
+        }
+    }
+    fn overwrite(&mut self, offset: usize, bytes: &[u8]) {
+        if offset
+            .checked_add(bytes.len())
+            .map_or(true, |end| end > self.len)
+        {
+            self.fail();
+        }
+    }
+    fn fail(&mut self) {
+        self.failed = true;
+    }
+}
+
 /// Wrapper over a slice of bytes that allows reading chunks from
 /// with the current position state held using a cursor.
 ///
@@ -91,7 +166,7 @@ impl<'a> Reader<'a> {
 pub trait Codec<'a>: Debug + Sized {
     /// Function for encoding itself by appending itself to
     /// the provided vec of bytes.
-    fn encode(&self, bytes: &mut Vec<u8>);
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder);
 
     /// Function for decoding itself from the provided reader
     /// will return Some if the decoding was successful or
@@ -121,7 +196,7 @@ pub trait Codec<'a>: Debug + Sized {
 }
 
 impl Codec<'_> for u8 {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         bytes.push(*self);
     }
 
@@ -139,7 +214,7 @@ pub(crate) fn put_u16(v: u16, out: &mut [u8]) {
 }
 
 impl Codec<'_> for u16 {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         let mut b16 = [0u8; 2];
         put_u16(*self, &mut b16);
         bytes.extend_from_slice(&b16);
@@ -167,7 +242,11 @@ impl From<u24> for usize {
 }
 
 impl Codec<'_> for u24 {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
+        if self.0 > 0x00ff_ffff {
+            bytes.fail();
+            return;
+        }
         let be_bytes = u32::to_be_bytes(self.0);
         bytes.extend_from_slice(&be_bytes[1..]);
     }
@@ -181,8 +260,8 @@ impl Codec<'_> for u24 {
 }
 
 impl Codec<'_> for u32 {
-    fn encode(&self, bytes: &mut Vec<u8>) {
-        bytes.extend(Self::to_be_bytes(*self));
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
+        bytes.extend_from_slice(&Self::to_be_bytes(*self));
     }
 
     fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
@@ -199,7 +278,7 @@ pub(crate) fn put_u64(v: u64, bytes: &mut [u8]) {
 }
 
 impl Codec<'_> for u64 {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         let mut b64 = [0u8; 8];
         put_u64(*self, &mut b64);
         bytes.extend_from_slice(&b64);
@@ -217,7 +296,7 @@ impl Codec<'_> for u64 {
 ///
 /// `TlsListElement` provides the size of the length prefix for the list.
 impl<'a, T: Codec<'a> + TlsListElement + Debug> Codec<'a> for Vec<T> {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    fn encode(&self, bytes: &mut dyn crate::msgs::codec::Encoder) {
         let nest = LengthPrefixedBuffer::new(T::SIZE_LEN, bytes);
 
         for i in self {
@@ -267,7 +346,7 @@ impl<'a, T: Codec<'a> + TlsListElement + Debug> Iterator for TlsListIter<'a, T> 
 }
 
 impl Codec<'_> for () {
-    fn encode(&self, _: &mut Vec<u8>) {}
+    fn encode(&self, _: &mut dyn crate::msgs::codec::Encoder) {}
 
     fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
         r.expect_empty("Empty")
@@ -325,7 +404,7 @@ impl ListLength {
 
 /// Tracks encoding a length-delimited structure in a single pass.
 pub(crate) struct LengthPrefixedBuffer<'a> {
-    pub(crate) buf: &'a mut Vec<u8>,
+    pub(crate) buf: &'a mut dyn Encoder,
     len_offset: usize,
     size_len: ListLength,
 }
@@ -335,9 +414,9 @@ impl<'a> LengthPrefixedBuffer<'a> {
     ///
     /// After this, the body of the length-delimited structure should be appended to `LengthPrefixedBuffer::buf`.
     /// The length header is corrected in `LengthPrefixedBuffer::drop`.
-    pub(crate) fn new(size_len: ListLength, buf: &'a mut Vec<u8>) -> Self {
+    pub(crate) fn new(size_len: ListLength, buf: &'a mut dyn Encoder) -> Self {
         let len_offset = buf.len();
-        buf.extend(match size_len {
+        buf.extend_from_slice(match size_len {
             ListLength::NonZeroU8 { .. } => &[0xff][..],
             ListLength::U16 | ListLength::NonZeroU16 { .. } => &[0xff, 0xff],
             ListLength::U24 { .. } => &[0xff, 0xff, 0xff],
@@ -354,30 +433,24 @@ impl<'a> LengthPrefixedBuffer<'a> {
 impl Drop for LengthPrefixedBuffer<'_> {
     /// Goes back and corrects the length previously inserted at the start of the structure.
     fn drop(&mut self) {
-        match self.size_len {
-            ListLength::NonZeroU8 { .. } => {
-                let len = self.buf.len() - self.len_offset - 1;
-                debug_assert!(len <= 0xff);
-                self.buf[self.len_offset] = len as u8;
-            }
-            ListLength::U16 | ListLength::NonZeroU16 { .. } => {
-                let len = self.buf.len() - self.len_offset - 2;
-                debug_assert!(len <= 0xffff);
-                let out: &mut [u8; 2] = (&mut self.buf[self.len_offset..self.len_offset + 2])
-                    .try_into()
-                    .unwrap();
-                *out = u16::to_be_bytes(len as u16);
-            }
-            ListLength::U24 { .. } => {
-                let len = self.buf.len() - self.len_offset - 3;
-                debug_assert!(len <= 0xff_ffff);
-                let len_bytes = u32::to_be_bytes(len as u32);
-                let out: &mut [u8; 3] = (&mut self.buf[self.len_offset..self.len_offset + 3])
-                    .try_into()
-                    .unwrap();
-                out.copy_from_slice(&len_bytes[1..]);
-            }
-        }
+        let (width, max) = match self.size_len {
+            ListLength::NonZeroU8 { .. } => (1, 0xff),
+            ListLength::U16 | ListLength::NonZeroU16 { .. } => (2, 0xffff),
+            ListLength::U24 { .. } => (3, 0xff_ffff),
+        };
+        let Some(len) = self
+            .buf
+            .len()
+            .checked_sub(self.len_offset)
+            .and_then(|len| len.checked_sub(width))
+            .filter(|&len| len <= max)
+        else {
+            self.buf.fail();
+            return;
+        };
+        let bytes = (len as u32).to_be_bytes();
+        self.buf
+            .overwrite(self.len_offset, &bytes[4 - width..]);
     }
 }
 
@@ -393,11 +466,15 @@ mod tests {
         let mut buf = Vec::new();
         let nested = LengthPrefixedBuffer::new(ListLength::U16, &mut buf);
         nested.buf.push(0xaa);
-        assert_eq!(nested.buf, &vec![0xff, 0xff, 0xaa]);
+        core::mem::forget(nested);
+        assert_eq!(buf, vec![0xff, 0xff, 0xaa]);
         // <- if the buffer is accidentally read here, there is no possibility
         //    that the contents of the length-prefixed buffer are interpreted
         //    as a subsequent encoding (perhaps allowing injection of a different
         //    extension)
+        let mut buf = Vec::new();
+        let nested = LengthPrefixedBuffer::new(ListLength::U16, &mut buf);
+        nested.buf.push(0xaa);
         drop(nested);
         assert_eq!(buf, vec![0x00, 0x01, 0xaa]);
     }

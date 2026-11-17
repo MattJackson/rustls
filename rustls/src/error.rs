@@ -16,6 +16,8 @@ use crate::rand;
 #[non_exhaustive]
 #[derive(Debug, PartialEq, Clone)]
 pub enum Error {
+    /// A bounded output allocation or supported-profile requirement failed.
+    OutputStorage(crate::OutputStorageError),
     /// We received a TLS message that isn't valid right now.
     /// `expect_types` lists the message types we can expect right now.
     /// `got_type` is the type we found.  This error is typically
@@ -1008,6 +1010,7 @@ impl fmt::Display for Error {
                 write!(f, "keys may not be consistent: {why:?}")
             }
             Self::General(err) => write!(f, "unexpected error: {err}"),
+            Self::OutputStorage(err) => err.fmt(f),
             Self::Other(err) => write!(f, "other error: {err}"),
         }
     }

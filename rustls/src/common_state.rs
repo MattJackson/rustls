@@ -15,10 +15,12 @@ use crate::msgs::codec::Codec;
 use crate::msgs::enums::{AlertLevel, KeyUpdateRequest};
 use crate::msgs::fragmenter::MessageFragmenter;
 use crate::msgs::handshake::{CertificateChain, HandshakeMessagePayload, ProtocolName};
+use crate::msgs::message::EncodedPayload;
 use crate::msgs::message::{
     Message, MessagePayload, OutboundChunks, OutboundOpaqueMessage, OutboundPlainMessage,
     PlainMessage,
 };
+use crate::output_storage::{OutputBuffer, OutputStorage, OutputStorageError};
 use crate::record_layer::PreEncryptAction;
 use crate::suites::{PartiallyExtractedSecrets, SupportedCipherSuite};
 #[cfg(feature = "tls12")]
@@ -53,8 +55,11 @@ pub struct CommonState {
     pub(crate) received_plaintext: ChunkVecBuffer,
     pub(crate) sendable_tls: ChunkVecBuffer,
     pub(crate) write_tracking: Option<WriteTracker>,
+    pub(crate) prepared_write_tracking: Option<WriteTracker>,
+    pub(crate) output_storage: Option<OutputStorage>,
+    output_fault: Option<WriteTrackingFault>,
     pub(crate) application_data_sent: bool,
-    queued_key_update_message: Option<Vec<u8>>,
+    queued_key_update_message: Option<OutputBuffer>,
 
     /// Protocol whose key schedule should be used. Unused for TLS < 1.3.
     pub(crate) protocol: Protocol,
@@ -67,25 +72,116 @@ pub struct CommonState {
 }
 
 impl CommonState {
+    pub(crate) fn encode_output(
+        &self,
+        recipe: impl Fn(&mut dyn crate::msgs::codec::Encoder),
+    ) -> Result<OutputBuffer, Error> {
+        if let Some(storage) = &self.output_storage {
+            storage.encode(recipe).map_err(|error| {
+                storage.fault(error);
+                Error::from(error)
+            })
+        } else {
+            let mut bytes = Vec::new();
+            recipe(&mut bytes);
+            Ok(bytes.into())
+        }
+    }
+    pub(crate) fn install_output_storage(
+        &mut self,
+        plan: Option<crate::OutputStoragePlan>,
+    ) -> Result<(), Error> {
+        let Some(plan) = plan else {
+            return Ok(());
+        };
+        // Largest overhead in the supported AWS-LC TLS1.2/1.3 profile: header + GCM nonce + tag.
+        if plan.limits().ciphertext_bytes.get()
+            < self
+                .message_fragmenter
+                .maximum_plaintext()
+                + 5
+                + 8
+                + 16
+        {
+            return Err(OutputStorageError::Limit.into());
+        }
+        let n = plan.limits().pending_records.get();
+        self.sendable_tls.reserve_chunks(n)?;
+        self.prepared_write_tracking = Some(
+            WriteTracker::new(
+                crate::WriteTrackingLimits {
+                    max_pending_records: n,
+                },
+                0,
+            )
+            .map_err(|_| OutputStorageError::Limit)?,
+        );
+        self.output_storage = Some(OutputStorage::new(plan));
+        Ok(())
+    }
+
+    pub(crate) fn handshake<'a>(&self, parsed: HandshakeMessagePayload<'a>) -> MessagePayload<'a> {
+        let Some(storage) = &self.output_storage else {
+            return MessagePayload::handshake(parsed);
+        };
+        let encoded = match storage.encode(|out| parsed.encode(out)) {
+            Ok(encoded) => EncodedPayload::bounded(encoded),
+            Err(error) => {
+                storage.fault(error);
+                Payload::empty().into()
+            }
+        };
+        MessagePayload::Handshake { parsed, encoded }
+    }
     /// Read-only cumulative output evidence, if tracking was enabled on this connection.
     pub fn write_progress(&self) -> Option<WriteProgress> {
         self.write_tracking
             .as_ref()
             .map(WriteTracker::progress)
+            .map(|mut progress| {
+                progress.fault = progress
+                    .fault
+                    .or(self.output_fault)
+                    .or_else(|| self.storage_fault());
+                progress
+            })
+    }
+
+    fn storage_fault(&self) -> Option<WriteTrackingFault> {
+        self.output_storage
+            .as_ref()
+            .and_then(OutputStorage::error)
+            .map(|error| match error {
+                OutputStorageError::Limit => WriteTrackingFault::Limit,
+                OutputStorageError::Integrity => WriteTrackingFault::Integrity,
+                _ => WriteTrackingFault::Unsupported,
+            })
     }
 
     pub(crate) fn tracking_fault(&self) -> Option<WriteTrackingFault> {
         self.write_progress()
             .and_then(|progress| progress.fault)
+            .or(self.output_fault)
+            .or_else(|| self.storage_fault())
     }
 
-    fn fail_tracking(&mut self, fault: WriteTrackingFault) {
+    pub(crate) fn fail_tracking(&mut self, fault: WriteTrackingFault) {
+        if self.output_storage.is_some() {
+            self.output_fault.get_or_insert(fault);
+        }
         if let Some(tracker) = &mut self.write_tracking {
             tracker.fault(fault);
         }
     }
 
     pub(crate) fn check_tracking(&self) -> Result<(), Error> {
+        if let Some(error) = self
+            .output_storage
+            .as_ref()
+            .and_then(OutputStorage::error)
+        {
+            return Err(error.into());
+        }
         match self.tracking_fault() {
             Some(fault) => Err(Error::General(alloc::format!("{fault}"))),
             None => Ok(()),
@@ -115,6 +211,9 @@ impl CommonState {
             received_plaintext: ChunkVecBuffer::new(Some(DEFAULT_RECEIVED_PLAINTEXT_LIMIT)),
             sendable_tls: ChunkVecBuffer::new(Some(DEFAULT_BUFFER_LIMIT)),
             write_tracking: None,
+            prepared_write_tracking: None,
+            output_storage: None,
+            output_fault: None,
             application_data_sent: false,
             queued_key_update_message: None,
             protocol: Protocol::Tcp,
@@ -444,7 +543,7 @@ impl CommonState {
     }
 
     fn send_single_fragment(&mut self, m: OutboundPlainMessage<'_>) -> bool {
-        if self.write_tracking.is_some() {
+        if self.write_tracking.is_some() || self.output_storage.is_some() {
             return self.send_tracked_fragment(m);
         }
         if m.typ == ContentType::Alert {
@@ -484,7 +583,7 @@ impl CommonState {
             return false;
         }
         let plaintext_len = m.payload.len();
-        let mapping = if application {
+        let mapping = if application && self.write_tracking.is_some() {
             match self
                 .record_layer
                 .plaintext_ciphertext_range(plaintext_len)
@@ -504,19 +603,11 @@ impl CommonState {
         } else {
             None
         };
-        let encrypted = match self
-            .record_layer
-            .try_encrypt_outgoing(m)
-        {
-            Ok(encrypted) => encrypted,
-            Err(_) => {
-                self.fail_tracking(WriteTrackingFault::Encryption);
-                return false;
-            }
+        let Some(bytes) = self.encrypt_output(m, application) else {
+            return false;
         };
         // A pending KeyUpdate precedes this encoded record. Determine offsets after it.
         self.perhaps_write_key_update();
-        let bytes = encrypted.encode();
         let mapping = match mapping {
             Some(range) => {
                 let header = crate::msgs::fragmenter::PACKET_OVERHEAD;
@@ -534,6 +625,65 @@ impl CommonState {
             None => None,
         };
         self.queue_encoded(bytes, mapping)
+    }
+
+    fn encrypt_output(
+        &mut self,
+        m: OutboundPlainMessage<'_>,
+        application: bool,
+    ) -> Option<OutputBuffer> {
+        if self.tracking_fault().is_some() {
+            return None;
+        }
+        let result = if let Some(storage) = &self.output_storage {
+            let Some(required) = self
+                .record_layer
+                .output_storage_bytes(m.payload.len())
+            else {
+                storage.fault(OutputStorageError::UnsupportedProvider);
+                self.fail_tracking(WriteTrackingFault::Unsupported);
+                return None;
+            };
+            let buffer = match storage.record(required) {
+                Ok(buffer) => buffer,
+                Err(OutputStorageError::Limit)
+                    if application
+                        && !self.sendable_tls.is_empty()
+                        && required
+                            <= storage
+                                .plan()
+                                .limits()
+                                .ciphertext_bytes
+                                .get() =>
+                {
+                    return None;
+                }
+                Err(error) => {
+                    storage.fault(error);
+                    return None;
+                }
+            };
+            self.record_layer
+                .encrypt_reserved(m, buffer)
+        } else {
+            self.record_layer
+                .try_encrypt_outgoing(m)
+                .map(|encrypted| encrypted.encode().into())
+        };
+        match result {
+            Ok(buffer) => Some(buffer),
+            Err(Error::OutputStorage(error)) => {
+                if let Some(storage) = &self.output_storage {
+                    storage.fault(error);
+                }
+                self.fail_tracking(WriteTrackingFault::Integrity);
+                None
+            }
+            Err(_) => {
+                self.fail_tracking(WriteTrackingFault::Encryption);
+                None
+            }
+        }
     }
 
     /// Take the remedial action needed before encrypting the record `add` records after the next.
@@ -622,12 +772,12 @@ impl CommonState {
     // Put m into sendable_tls for writing.
     fn queue_tls_message(&mut self, m: OutboundOpaqueMessage) {
         self.perhaps_write_key_update();
-        self.queue_encoded(m.encode(), None);
+        self.queue_encoded(m.encode().into(), None);
     }
 
     fn queue_encoded(
         &mut self,
-        bytes: Vec<u8>,
+        bytes: OutputBuffer,
         application: Option<core::ops::Range<usize>>,
     ) -> bool {
         if let Some(tracker) = &mut self.write_tracking {
@@ -639,7 +789,14 @@ impl CommonState {
                 return false;
             }
         }
-        self.sendable_tls.append(bytes);
+        let len = bytes.len();
+        if self.sendable_tls.append(bytes) != len {
+            self.fail_tracking(WriteTrackingFault::Integrity);
+            if let Some(storage) = &self.output_storage {
+                storage.fault(OutputStorageError::Integrity);
+            }
+            return false;
+        }
         true
     }
 
@@ -651,6 +808,63 @@ impl CommonState {
 
     /// Send a raw TLS message, fragmenting it if needed.
     pub(crate) fn send_msg(&mut self, m: Message<'_>, must_encrypt: bool) {
+        if let Some(storage) = self.output_storage.clone() {
+            if self.tracking_fault().is_some() {
+                return;
+            }
+            let typ = m.payload.content_type();
+            let encoded = match m.payload {
+                MessagePayload::Handshake { encoded, .. }
+                | MessagePayload::HandshakeFlight(encoded) => encoded,
+                payload => match storage.encode(|out| payload.encode(out)) {
+                    Ok(bytes) => EncodedPayload::bounded(bytes),
+                    Err(error) => {
+                        storage.fault(error);
+                        return;
+                    }
+                },
+            };
+            for fragment in self
+                .message_fragmenter
+                .fragment_payload(typ, m.version, encoded.bytes().into())
+            {
+                if must_encrypt {
+                    if !self.send_single_fragment(fragment) {
+                        break;
+                    }
+                } else {
+                    let Some(required) = fragment.payload.len().checked_add(5) else {
+                        storage.fault(OutputStorageError::Limit);
+                        break;
+                    };
+                    let buffer = match storage.record(required) {
+                        Ok(buffer) => buffer,
+                        Err(error) => {
+                            storage.fault(error);
+                            break;
+                        }
+                    };
+                    let (bytes, reservation) = buffer.into_parts();
+                    let mut payload =
+                        match crate::msgs::message::PrefixedPayload::from_reserved(bytes, required)
+                        {
+                            Ok(payload) => payload,
+                            Err(error) => {
+                                storage.fault(error);
+                                break;
+                            }
+                        };
+                    payload.extend_from_chunks(&fragment.payload);
+                    let bytes = OutboundOpaqueMessage::new(fragment.typ, fragment.version, payload)
+                        .encode();
+                    self.perhaps_write_key_update();
+                    if !self.queue_encoded(OutputBuffer::from_parts(bytes, reservation), None) {
+                        break;
+                    }
+                }
+            }
+            return;
+        }
         {
             if let Protocol::Quic = self.protocol {
                 if let MessagePayload::Alert(alert) = m.payload {
@@ -918,6 +1132,24 @@ impl CommonState {
     }
 
     pub(crate) fn enqueue_key_update_notification(&mut self) {
+        if self.output_storage.is_some() {
+            let message = self.handshake(HandshakeMessagePayload(
+                crate::msgs::handshake::HandshakePayload::KeyUpdate(
+                    KeyUpdateRequest::UpdateNotRequested,
+                ),
+            ));
+            if let MessagePayload::Handshake { encoded, .. } = message {
+                self.queued_key_update_message = self.encrypt_output(
+                    OutboundPlainMessage {
+                        typ: ContentType::Handshake,
+                        version: ProtocolVersion::TLSv1_3,
+                        payload: encoded.bytes().into(),
+                    },
+                    false,
+                );
+            }
+            return;
+        }
         let message = PlainMessage::from(Message::build_key_update_notify());
         if self.write_tracking.is_some() {
             if self.tracking_fault().is_some() {
@@ -927,7 +1159,7 @@ impl CommonState {
                 .record_layer
                 .try_encrypt_outgoing(message.borrow_outbound())
             {
-                Ok(encrypted) => self.queued_key_update_message = Some(encrypted.encode()),
+                Ok(encrypted) => self.queued_key_update_message = Some(encrypted.encode().into()),
                 Err(_) => self.fail_tracking(WriteTrackingFault::Encryption),
             }
             return;
@@ -935,7 +1167,8 @@ impl CommonState {
         self.queued_key_update_message = Some(
             self.record_layer
                 .encrypt_outgoing(message.borrow_outbound())
-                .encode(),
+                .encode()
+                .into(),
         );
     }
 
@@ -964,6 +1197,10 @@ impl CommonState {
     }
 
     pub(crate) fn send_early_plaintext(&mut self, data: &[u8]) -> usize {
+        if self.output_storage.is_some() {
+            self.fail_tracking(WriteTrackingFault::Unsupported);
+            return 0;
+        }
         debug_assert!(self.early_traffic);
         debug_assert!(self.record_layer.is_encrypting());
 
@@ -989,6 +1226,10 @@ impl CommonState {
         sendable_plaintext: &mut ChunkVecBuffer,
     ) -> usize {
         if !self.may_send_application_data {
+            if self.output_storage.is_some() {
+                self.fail_tracking(WriteTrackingFault::Unsupported);
+                return 0;
+            }
             // If we haven't completed handshaking, buffer
             // plaintext to send once we do.
             let len = match limit {
@@ -1247,35 +1488,80 @@ impl KxState {
 
 pub(crate) struct HandshakeFlight<'a, const TLS13: bool> {
     pub(crate) transcript: &'a mut HandshakeHash,
-    body: Vec<u8>,
+    body: OutputBuffer,
+    storage: Option<OutputStorage>,
 }
 
 impl<'a, const TLS13: bool> HandshakeFlight<'a, TLS13> {
-    pub(crate) fn new(transcript: &'a mut HandshakeHash) -> Self {
+    pub(crate) fn encode_output(
+        &self,
+        recipe: impl Fn(&mut dyn crate::msgs::codec::Encoder),
+    ) -> Result<OutputBuffer, Error> {
+        if let Some(storage) = &self.storage {
+            storage.encode(recipe).map_err(|error| {
+                storage.fault(error);
+                Error::from(error)
+            })
+        } else {
+            let mut bytes = Vec::new();
+            recipe(&mut bytes);
+            Ok(bytes.into())
+        }
+    }
+    pub(crate) fn new(transcript: &'a mut HandshakeHash, common: &CommonState) -> Self {
         Self {
             transcript,
-            body: Vec::new(),
+            body: Vec::new().into(),
+            storage: common.output_storage.clone(),
         }
     }
 
     pub(crate) fn add(&mut self, hs: HandshakeMessagePayload<'_>) {
         let start_len = self.body.len();
-        hs.encode(&mut self.body);
+        if let Some(storage) = &self.storage {
+            match storage.encode(|out| {
+                out.extend_from_slice(&self.body);
+                hs.encode(out);
+            }) {
+                Ok(body) => self.body = body,
+                Err(error) => {
+                    storage.fault(error);
+                    return;
+                }
+            }
+        } else {
+            hs.encode(&mut self.body);
+        }
         self.transcript
             .add(&self.body[start_len..]);
     }
 
     pub(crate) fn finish(self, common: &mut CommonState) {
+        let body = if self.storage.is_some() {
+            EncodedPayload::bounded(self.body)
+        } else {
+            Payload::new(self.body.into_parts().0).into()
+        };
         common.send_msg(
             Message {
                 version: match TLS13 {
                     true => ProtocolVersion::TLSv1_3,
                     false => ProtocolVersion::TLSv1_2,
                 },
-                payload: MessagePayload::HandshakeFlight(Payload::new(self.body)),
+                payload: MessagePayload::HandshakeFlight(body),
             },
             TLS13,
         );
+    }
+
+    pub(crate) fn refuse_compression(&self) -> bool {
+        if let Some(storage) = &self.storage {
+            storage.fault(OutputStorageError::UnsupportedConfiguration(
+                crate::OutputStorageFeature::CertificateCompression,
+            ));
+            return true;
+        }
+        false
     }
 }
 

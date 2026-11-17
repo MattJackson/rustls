@@ -226,7 +226,7 @@ mod tests {
 
         let end_of_early_data_flight = Message {
             version: ProtocolVersion::TLSv1_3,
-            payload: MessagePayload::HandshakeFlight(Payload::Borrowed(b"\x05\x00\x00\x00")),
+            payload: MessagePayload::HandshakeFlight(Payload::Borrowed(b"\x05\x00\x00\x00").into()),
         };
 
         // buffered mode

@@ -162,6 +162,9 @@ pub trait ResolvesClientCert: fmt::Debug + Send + Sync {
 /// [`RootCertStore`]: crate::RootCertStore
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
+    /// Optional requested-layout output plan; validate before connection construction.
+    pub output_storage: Option<crate::OutputStoragePlan>,
+
     /// Which ALPN protocols we include in our client hello.
     /// If empty, no ALPN extension is sent.
     pub alpn_protocols: Vec<Vec<u8>>,
@@ -306,6 +309,23 @@ pub struct TicketRequest {
 }
 
 impl ClientConfig {
+    /// Validate the bounded outgoing profile without allocating handshake output.
+    pub fn validate_output_storage(&self) -> Result<(), crate::OutputStorageError> {
+        if self.output_storage.is_none() {
+            return Ok(());
+        }
+        crate::output_storage::validate_compression(
+            &self.cert_compressors,
+            &self.cert_compression_cache,
+        )?;
+        if self.ech_mode.is_some() {
+            return Err(crate::OutputStorageError::UnsupportedConfiguration(
+                crate::OutputStorageFeature::Ech,
+            ));
+        }
+        Ok(())
+    }
+
     /// Create a builder for a client configuration with
     /// [the process-default `CryptoProvider`][CryptoProvider#using-the-per-process-default-cryptoprovider]
     /// and safe protocol version defaults.
@@ -874,8 +894,13 @@ impl ConnectionCore<ClientConnectionData> {
         extra_exts: ClientExtensionsInput<'static>,
         proto: Protocol,
     ) -> Result<Self, Error> {
+        config.validate_output_storage()?;
+        if config.output_storage.is_some() && proto != Protocol::Tcp {
+            return Err(crate::OutputStorageError::UnsupportedProvider.into());
+        }
         let mut common_state = CommonState::new(Side::Client);
         common_state.set_max_fragment_size(config.max_fragment_size)?;
+        common_state.install_output_storage(config.output_storage)?;
         common_state.protocol = proto;
         common_state.enable_secret_extraction = config.enable_secret_extraction;
         common_state.fips = config.fips();
@@ -890,6 +915,7 @@ impl ConnectionCore<ClientConnectionData> {
 
         let input = ClientHelloInput::new(name, &extra_exts, &mut cx, config)?;
         let state = input.start_handshake(extra_exts, &mut cx)?;
+        common_state.check_tracking()?;
         Ok(Self::new(state, data, common_state))
     }
 
@@ -935,6 +961,9 @@ impl UnbufferedClientConnection {
         name: ServerName<'static>,
         extensions: ClientExtensionsInput<'static>,
     ) -> Result<Self, Error> {
+        if config.output_storage.is_some() {
+            return Err(crate::OutputStorageError::UnsupportedProvider.into());
+        }
         Ok(Self {
             inner: UnbufferedConnectionCommon::from(ConnectionCore::for_client(
                 config,

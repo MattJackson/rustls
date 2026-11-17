@@ -537,7 +537,18 @@ impl KeyScheduleTraffic {
     ) -> Result<(), Error> {
         common.check_tracking()?;
         common.check_aligned_handshake()?;
-        common.send_msg_encrypt(Message::build_key_update_request().into());
+        let payload = common.handshake(crate::msgs::handshake::HandshakeMessagePayload(
+            crate::msgs::handshake::HandshakePayload::KeyUpdate(
+                crate::msgs::enums::KeyUpdateRequest::UpdateRequested,
+            ),
+        ));
+        common.send_msg(
+            Message {
+                version: crate::ProtocolVersion::TLSv1_3,
+                payload,
+            },
+            true,
+        );
         common.check_tracking()?;
         let secret = self.next_application_traffic_secret(common.side);
         self.ks.set_encrypter(&secret, common);

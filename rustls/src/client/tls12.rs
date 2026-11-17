@@ -528,7 +528,7 @@ fn emit_certificate(
 ) {
     let cert = Message {
         version: ProtocolVersion::TLSv1_2,
-        payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::Certificate(
+        payload: common.handshake(HandshakeMessagePayload(HandshakePayload::Certificate(
             cert_chain,
         ))),
     };
@@ -543,21 +543,22 @@ fn emit_client_kx(
     common: &mut CommonState,
     pub_key: &[u8],
 ) {
-    let mut buf = Vec::new();
-    match kxa {
+    let params = match kxa {
         KeyExchangeAlgorithm::ECDHE => ClientKeyExchangeParams::Ecdh(ClientEcdhParams {
             public: PayloadU8::new(pub_key.to_vec()),
         }),
         KeyExchangeAlgorithm::DHE => ClientKeyExchangeParams::Dh(ClientDhParams {
             public: PayloadU16::new(pub_key.to_vec()),
         }),
-    }
-    .encode(&mut buf);
-    let pubkey = Payload::new(buf);
+    };
+    let Ok(buf) = common.encode_output(|out| params.encode(out)) else {
+        return;
+    };
+    let pubkey = Payload::Borrowed(&buf);
 
     let ckx = Message {
         version: ProtocolVersion::TLSv1_2,
-        payload: MessagePayload::handshake(HandshakeMessagePayload(
+        payload: common.handshake(HandshakeMessagePayload(
             HandshakePayload::ClientKeyExchange(pubkey),
         )),
     };
@@ -581,7 +582,7 @@ fn emit_certverify(
 
     let m = Message {
         version: ProtocolVersion::TLSv1_2,
-        payload: MessagePayload::handshake(HandshakeMessagePayload(
+        payload: common.handshake(HandshakeMessagePayload(
             HandshakePayload::CertificateVerify(body),
         )),
     };
@@ -607,11 +608,11 @@ fn emit_finished(
 ) {
     let vh = transcript.current_hash();
     let verify_data = secrets.client_verify_data(&vh);
-    let verify_data_payload = Payload::new(verify_data);
+    let verify_data_payload = Payload::Borrowed(&verify_data);
 
     let f = Message {
         version: ProtocolVersion::TLSv1_2,
-        payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::Finished(
+        payload: common.handshake(HandshakeMessagePayload(HandshakePayload::Finished(
             verify_data_payload,
         ))),
     };
