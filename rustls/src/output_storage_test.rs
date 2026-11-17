@@ -107,7 +107,10 @@ fn ticket_extend_overflow_is_sticky_and_never_publishes_success() {
     let storage = crate::TicketStorage::new(&account);
     let mut ticket = storage.allocate(8).unwrap();
     ticket.extend(&[1; 9]);
-    assert!(matches!(ticket.check_len(9), Err(crate::OutputStorageError::Integrity)));
+    assert!(matches!(
+        ticket.check_len(9),
+        Err(crate::OutputStorageError::Integrity)
+    ));
     assert_eq!(ticket.requested_capacity(), 8);
     assert_eq!(account.error(), Some(crate::OutputStorageError::Integrity));
     assert_eq!(account.allocation_attempts(), 1);
@@ -118,7 +121,9 @@ fn ticket_extend_overflow_is_sticky_and_never_publishes_success() {
 #[test]
 fn client_ticket_payload_alias_keeps_one_funded_backing() {
     let account = OutputStorage::new(plan(1, 1, 8));
-    let ticket = crate::TicketStorage::new(&account).copy(b"identity").unwrap();
+    let ticket = crate::TicketStorage::new(&account)
+        .copy(b"identity")
+        .unwrap();
     let payload = crate::msgs::message::EncodedPayload::ticket(ticket);
     let alias = payload.clone();
     drop(payload);
@@ -134,8 +139,124 @@ fn denied_ticket_copy_never_attempts_backing_allocation() {
     let account = OutputStorage::new(plan(1, 1, 8));
     let held = account.serialization(8).unwrap();
     let before = account.allocation_attempts();
-    assert!(crate::TicketStorage::new(&account).copy(b"x").is_err());
+    assert!(
+        crate::TicketStorage::new(&account)
+            .copy(b"x")
+            .is_err()
+    );
     assert_eq!(account.allocation_attempts(), before);
     drop(held);
     assert!(account.serialization(8).is_ok());
+}
+
+#[test]
+fn bounded_ticket_message_uses_the_same_tls12_and_tls13_wire_recipe() {
+    use crate::msgs::handshake::{
+        BoundedNewSessionTicketPayload, HandshakeMessagePayload, HandshakePayload,
+        NewSessionTicketExtensions, NewSessionTicketPayload, NewSessionTicketPayloadTls13,
+    };
+    for tls13 in [false, true] {
+        let account = OutputStorage::new(plan(1, 1, 1024));
+        let storage = crate::TicketStorage::new(&account);
+        let bounded = HandshakeMessagePayload(HandshakePayload::BoundedNewSessionTicket(
+            BoundedNewSessionTicketPayload {
+                lifetime: 123,
+                nonce: tls13.then(|| (7, storage.copy(b"nonce").unwrap())),
+                ticket: storage
+                    .copy(b"ticket ciphertext")
+                    .unwrap(),
+                extensions: NewSessionTicketExtensions::default(),
+            },
+        ));
+        let legacy = if tls13 {
+            HandshakePayload::NewSessionTicketTls13(NewSessionTicketPayloadTls13::new(
+                123,
+                7,
+                b"nonce".to_vec(),
+                b"ticket ciphertext".to_vec(),
+            ))
+        } else {
+            HandshakePayload::NewSessionTicket(NewSessionTicketPayload {
+                lifetime_hint: 123,
+                ticket: Arc::new(crate::msgs::base::PayloadU16::new(
+                    b"ticket ciphertext".to_vec(),
+                )),
+            })
+        };
+        let expected = HandshakeMessagePayload(legacy).get_encoding();
+        let encoded = account
+            .encode(|out| bounded.encode(out))
+            .unwrap();
+        assert_eq!(encoded.as_ref(), expected);
+        drop(encoded);
+        drop(bounded);
+        assert!(account.serialization(1024).is_ok());
+    }
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn rotating_factory_must_explicitly_advertise_and_recheck_its_selected_producer() {
+    use crate::server::ProducesTickets;
+    use alloc::boxed::Box;
+    use core::time::Duration;
+
+    #[derive(Debug)]
+    struct Producer(bool);
+    impl ProducesTickets for Producer {
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn lifetime(&self) -> u32 {
+            1
+        }
+        fn supports_bounded_output(&self) -> bool {
+            self.0
+        }
+        fn encrypt(&self, _: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+            panic!("rotation called a legacy allocator-owning producer");
+        }
+        fn encrypt_bounded(
+            &self,
+            _: &[u8],
+            _: &crate::TicketStorage<'_>,
+        ) -> Result<Option<crate::TicketBuffer>, crate::OutputStorageError> {
+            assert!(self.0, "unsupported rotated producer was invoked");
+            Ok(None)
+        }
+        fn decrypt(&self, _: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+            None
+        }
+    }
+    fn good() -> Result<Box<dyn ProducesTickets>, crate::rand::GetRandomFailed> {
+        Ok(Box::new(Producer(true)))
+    }
+    fn bad() -> Result<Box<dyn ProducesTickets>, crate::rand::GetRandomFailed> {
+        Ok(Box::new(Producer(false)))
+    }
+    assert!(
+        !crate::TicketRotator::new(1, good)
+            .unwrap()
+            .supports_bounded_output()
+    );
+    assert!(crate::TicketRotator::new_bounded(1, bad).is_err());
+    let mut rotator = crate::TicketRotator::new_bounded(1, good).unwrap();
+    let mut switcher = crate::TicketSwitcher::new_bounded(1, good).unwrap();
+    rotator.generator = bad;
+    switcher.generator = bad;
+    let now = pki_types::UnixTime::now().as_secs();
+    for offset in [10, 20] {
+        let later = pki_types::UnixTime::since_unix_epoch(Duration::from_secs(now + offset));
+        drop(rotator.maybe_roll(later));
+        drop(switcher.maybe_roll(later));
+    }
+    for producer in [&rotator as &dyn ProducesTickets, &switcher] {
+        let account = OutputStorage::new(plan(1, 1, 32));
+        let storage = crate::TicketStorage::new(&account);
+        assert!(matches!(
+            producer.encrypt_bounded(b"state", &storage),
+            Err(crate::OutputStorageError::UnsupportedProvider)
+        ));
+        assert_eq!(account.allocation_attempts(), 0);
+    }
 }
