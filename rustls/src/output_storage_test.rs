@@ -100,3 +100,42 @@ fn counting_refuses_truncated_protocol_lengths_before_allocating_output() {
     crate::msgs::codec::u24(0x0100_0000).encode(&mut count);
     assert!(count.finish().is_err());
 }
+
+#[test]
+fn ticket_extend_overflow_is_sticky_and_never_publishes_success() {
+    let account = OutputStorage::new(plan(1, 1, 8));
+    let storage = crate::TicketStorage::new(&account);
+    let mut ticket = storage.allocate(8).unwrap();
+    ticket.extend(&[1; 9]);
+    assert!(matches!(ticket.check_len(9), Err(crate::OutputStorageError::Integrity)));
+    assert_eq!(ticket.requested_capacity(), 8);
+    assert_eq!(account.error(), Some(crate::OutputStorageError::Integrity));
+    assert_eq!(account.allocation_attempts(), 1);
+    assert!(storage.allocate(1).is_err());
+    assert_eq!(account.allocation_attempts(), 1);
+}
+
+#[test]
+fn client_ticket_payload_alias_keeps_one_funded_backing() {
+    let account = OutputStorage::new(plan(1, 1, 8));
+    let ticket = crate::TicketStorage::new(&account).copy(b"identity").unwrap();
+    let payload = crate::msgs::message::EncodedPayload::ticket(ticket);
+    let alias = payload.clone();
+    drop(payload);
+    assert!(account.serialization(1).is_err());
+    assert_eq!(alias.bytes(), b"identity");
+    assert_eq!(account.allocation_attempts(), 1);
+    drop(alias);
+    assert!(account.serialization(8).is_ok());
+}
+
+#[test]
+fn denied_ticket_copy_never_attempts_backing_allocation() {
+    let account = OutputStorage::new(plan(1, 1, 8));
+    let held = account.serialization(8).unwrap();
+    let before = account.allocation_attempts();
+    assert!(crate::TicketStorage::new(&account).copy(b"x").is_err());
+    assert_eq!(account.allocation_attempts(), before);
+    drop(held);
+    assert!(account.serialization(8).is_ok());
+}
