@@ -97,7 +97,7 @@ struct Record {
 pub(crate) fn descriptor_layout(
     records: usize,
 ) -> Result<usize, crate::output_storage::OutputStorageError> {
-    alloc::alloc::Layout::array::<Record>(records)
+    core::alloc::Layout::array::<Record>(records)
         .map(|layout| layout.size())
         .map_err(|_| crate::output_storage::OutputStorageError::Limit)
 }
