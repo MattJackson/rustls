@@ -1,0 +1,52 @@
+# Busbar FIPS line: runs the regression test for each RustSec fix backported onto rustls 0.23.43
+# (rustls/advisories.toml) and fails unless every named test ran and passed. Red on the tests-only
+# commit, green once the fixes are in. Fork CI only, not for upstream.
+name: busbar-proof
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: ['busbar/**']
+  workflow_dispatch:
+
+jobs:
+  proof:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: proof tests (lib, brotli feature)
+        run: |
+          set -o pipefail
+          cargo test --locked -p rustls --features brotli --lib --no-fail-fast -- \
+            debug_of_session_types test_brotli_rejects_large_window 2>&1 | tee lib.log
+      - name: proof tests (api)
+        if: always()
+        run: |
+          set -o pipefail
+          cargo test --locked -p rustls --test api --no-fail-fast -- \
+            client_rejects_encrypted_extensions_in_server_hello_record \
+            client_connection_rejects_record_containing_subsequent_messages \
+            server_connection_rejects_record_containing_subsequent_messages \
+            client_hello_acceptor_rejects_record_containing_subsequent_messages \
+            test_client_does_not_save_kx_hint_from_unauthenticated_server_hello 2>&1 | tee api.log
+      - name: every proof test ran and passed
+        if: always()
+        run: |
+          rc=0
+          for t in debug_of_session_types test_brotli_rejects_large_window \
+            client_rejects_encrypted_extensions_in_server_hello_record \
+            client_connection_rejects_record_containing_subsequent_messages \
+            server_connection_rejects_record_containing_subsequent_messages \
+            client_hello_acceptor_rejects_record_containing_subsequent_messages \
+            test_client_does_not_save_kx_hint_from_unauthenticated_server_hello; do
+            ok=$(cat lib.log api.log | grep -cE "^test [A-Za-z0-9_:]*::$t \.\.\. ok$" || true)
+            bad=$(cat lib.log api.log | grep -cE "^test [A-Za-z0-9_:]*::$t \.\.\. FAILED$" || true)
+            echo "$t: $ok passed, $bad failed"
+            { [ "$ok" -ge 1 ] && [ "$bad" = 0 ]; } || rc=1
+          done
+          exit $rc
