@@ -464,6 +464,16 @@ mod tests {
         test_compressor(BROTLI_COMPRESSOR, BROTLI_DECOMPRESSOR);
     }
 
+    #[test]
+    #[cfg(feature = "brotli")]
+    fn test_brotli_rejects_large_window() {
+        let large_window_empty = [0x11, 0xd0];
+        brotli::BrotliDecompress(&mut &large_window_empty[..], &mut Vec::new()).unwrap();
+        BROTLI_DECOMPRESSOR
+            .decompress(&large_window_empty, &mut [])
+            .unwrap_err();
+    }
+
     fn test_compressor(comp: &dyn CertCompressor, decomp: &dyn CertDecompressor) {
         assert_eq!(comp.algorithm(), decomp.algorithm());
         for sz in [16, 64, 512, 2048, 8192, 16384] {
