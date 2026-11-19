@@ -6494,6 +6494,55 @@ fn test_client_sends_helloretryrequest() {
     ));
 }
 
+/// RUSTSEC-2026-0349: the ServerHello is not authenticated, so the key exchange group it selects
+/// must not be remembered for later ClientHellos unless the handshake then completes.
+#[cfg(feature = "tls12")]
+#[test]
+fn test_client_does_not_save_kx_hint_from_unauthenticated_server_hello() {
+    let provider = provider::default_provider();
+    let storage = Arc::new(ClientStorage::new());
+    let server_config = make_server_config(KeyType::Rsa2048, &provider);
+
+    // The client trusts only the ECDSA test CA and the server presents the RSA chain: the
+    // handshake fails at certificate verification, after the client processed the ServerHello.
+    let mut untrusting = make_client_config_with_kx_groups(
+        KeyType::EcdsaP256,
+        vec![provider::kx_group::SECP384R1],
+        &provider,
+    );
+    untrusting.resumption = Resumption::store(storage.clone());
+    let (mut client, mut server) = make_pair_for_configs(untrusting, server_config.clone());
+    let err = do_handshake_until_error(&mut client, &mut server).unwrap_err();
+    assert!(
+        matches!(err, ErrorFromPeer::Client(Error::InvalidCertificate(_))),
+        "{err:?}"
+    );
+    let ops = storage.ops();
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(op, ClientStorageOp::SetKxHint(..))),
+        "{ops:#?}"
+    );
+
+    // Control: once the server is authenticated, the same group is remembered.
+    let mut trusting = make_client_config_with_kx_groups(
+        KeyType::Rsa2048,
+        vec![provider::kx_group::SECP384R1],
+        &provider,
+    );
+    trusting.resumption = Resumption::store(storage.clone());
+    let (mut client, mut server) = make_pair_for_configs(trusting, server_config);
+    do_handshake_until_error(&mut client, &mut server).unwrap();
+    let ops = storage.ops();
+    assert!(
+        ops.iter().any(|op| matches!(
+            op,
+            ClientStorageOp::SetKxHint(_, rustls::NamedGroup::secp384r1)
+        )),
+        "{ops:#?}"
+    );
+}
+
 #[cfg(feature = "tls12")]
 #[test]
 fn test_client_attempts_to_use_unsupported_kx_group() {
