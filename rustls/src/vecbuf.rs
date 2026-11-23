@@ -90,6 +90,12 @@ impl ChunkVecBuffer {
         self.chunks.is_empty()
     }
 
+    pub(crate) fn release_idle(&mut self) {
+        if self.chunks.is_empty() {
+            self.chunks = VecDeque::new();
+        }
+    }
+
     /// How many bytes we're storing
     pub(crate) fn len(&self) -> usize {
         self.chunks
@@ -124,6 +130,17 @@ impl ChunkVecBuffer {
             }
             if self.chunks.is_empty() {
                 debug_assert_eq!(self.prefix_used, 0);
+            }
+
+            if let Some(max) = self.max_chunks {
+                if self.chunks.capacity() < max
+                    && self
+                        .chunks
+                        .try_reserve_exact(max - self.chunks.len())
+                        .is_err()
+                {
+                    return 0;
+                }
             }
 
             self.chunks.push_back(bytes);
