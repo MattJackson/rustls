@@ -159,6 +159,15 @@ pub(crate) struct DeframerVecBuffer {
 }
 
 impl DeframerVecBuffer {
+    pub(crate) fn release_idle(&mut self) {
+        if self.used == 0 {
+            // Decryption happens in place: wipe initialized storage before releasing it.
+            use zeroize::Zeroize;
+            self.buf.zeroize();
+            self.buf = Vec::new();
+        }
+    }
+
     /// Discard `taken` bytes from the start of our buffer.
     pub(crate) fn discard(&mut self, taken: usize) {
         #[allow(clippy::comparison_chain)]
