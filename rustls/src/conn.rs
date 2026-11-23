@@ -475,6 +475,23 @@ pub struct ConnectionCommon<Data> {
 }
 
 impl<Data> ConnectionCommon<Data> {
+    /// Release empty input and output backing at an established connection's idle point.
+    ///
+    /// Partial records, unread plaintext and pending output remain owned. Output slot arrays
+    /// are recreated within the original storage plan before accepting subsequent records.
+    pub fn release_idle_storage(&mut self) {
+        if self.is_handshaking() || self.wants_write() {
+            return;
+        }
+        self.deframer_buffer.release_idle();
+        self.sendable_plaintext.release_idle();
+        self.received_plaintext.release_idle();
+        self.sendable_tls.release_idle();
+        if let Some(tracking) = self.write_tracking.as_mut() {
+            tracking.release_idle();
+        }
+    }
+
     /// Processes any new packets read by a previous call to
     /// [`Connection::read_tls`].
     ///

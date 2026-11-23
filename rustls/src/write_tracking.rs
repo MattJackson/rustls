@@ -152,6 +152,12 @@ impl WriteTracker {
         self.records.len() < self.capacity
     }
 
+    pub(crate) fn release_idle(&mut self) {
+        if self.records.is_empty() {
+            self.records = VecDeque::new();
+        }
+    }
+
     /// Commit descriptor and byte offsets before the already-encoded record is appended.
     pub(crate) fn enqueue(
         &mut self,
@@ -193,6 +199,11 @@ impl WriteTracker {
             let stop = start
                 .checked_add(len)
                 .ok_or(WriteTrackingFault::Limit)?;
+            if self.records.capacity() < self.capacity {
+                self.records
+                    .try_reserve_exact(self.capacity - self.records.len())
+                    .map_err(|_| WriteTrackingFault::Limit)?;
+            }
             self.records.push_back(Record {
                 logical: logical_start..logical_end,
                 ciphertext: start..stop,
